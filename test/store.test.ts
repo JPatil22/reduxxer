@@ -58,6 +58,22 @@ test('buildContext renders a ghost file: imports + matched code + collapsed sibl
   assert.doesNotMatch(ghost, /bcrypt\.hashSync/, "the sibling's body is collapsed away");
 });
 
+test('stats().lastUpdated reflects the real last change, not the current time', async () => {
+  const store = new IndexStore();
+  store.upsertFile('a.ts', 'h', [chunk({})], 'x');
+  const first = store.stats().lastUpdated;
+
+  // Two reads with no change in between must return the SAME timestamp —
+  // the old bug returned new Date() on every call.
+  await new Promise((r) => setTimeout(r, 5));
+  assert.equal(store.stats().lastUpdated, first);
+
+  // A real change advances it.
+  await new Promise((r) => setTimeout(r, 5));
+  store.upsertFile('b.ts', 'h', [chunk({ filePath: 'b.ts', id: 'b.ts::foo' })], 'y');
+  assert.notEqual(store.stats().lastUpdated, first);
+});
+
 test('upsertFile then removeFile leaves the store empty', () => {
   const store = new IndexStore();
   store.upsertFile('a.ts', 'hash1', [chunk({})], 'function foo() {}');

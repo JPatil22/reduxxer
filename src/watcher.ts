@@ -78,8 +78,14 @@ export async function indexFile(store: IndexStore, filePath: string): Promise<vo
       chunk.embedding = vectors[i];
     });
     store.upsertFile(filePath, hash, chunks, content);
-  } catch {
-    // unreadable/binary file, ignore
+  } catch (err) {
+    // A file vanishing between walk and read (ENOENT) is normal churn and
+    // stays quiet. Anything else — a parse crash, an embedding failure — is
+    // surfaced so a partially-indexed repo isn't a silent mystery.
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code === 'ENOENT') return;
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`context-daemon: skipped ${filePath} — ${message}`);
   }
 }
 

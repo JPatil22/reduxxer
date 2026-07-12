@@ -7,6 +7,7 @@ import { embedText, cosineSimilarity, EMBEDDING_MODEL } from './embeddings.js';
 interface IndexSnapshot {
   version: 1;
   embeddingModel: string;
+  lastUpdatedAt?: string;
   files: FileRecord[];
   chunks: CodeChunk[];
 }
@@ -24,6 +25,8 @@ export class IndexStore {
   private searchLog: SearchLogEntry[] = [];
   private totalNaiveTokens = 0;
   private totalTargetedTokens = 0;
+  // Actual time the index last changed — not "now" on every stats() call.
+  private lastUpdatedAt = new Date().toISOString();
 
   getFileHash(filePath: string): string | undefined {
     return this.files.get(filePath)?.hash;
@@ -40,6 +43,7 @@ export class IndexStore {
       chunkIds.push(chunk.id);
     }
     this.files.set(filePath, { filePath, hash, chunkIds, content });
+    this.lastUpdatedAt = new Date().toISOString();
   }
 
   removeFile(filePath: string): void {
@@ -47,6 +51,7 @@ export class IndexStore {
     if (old) {
       for (const id of old.chunkIds) this.chunks.delete(id);
       this.files.delete(filePath);
+      this.lastUpdatedAt = new Date().toISOString();
     }
   }
 
@@ -267,7 +272,7 @@ export class IndexStore {
     return {
       files: this.files.size,
       chunks: this.chunks.size,
-      lastUpdated: new Date().toISOString(),
+      lastUpdated: this.lastUpdatedAt,
     };
   }
 
@@ -322,6 +327,7 @@ export class IndexStore {
     const snapshot: IndexSnapshot = {
       version: 1,
       embeddingModel: EMBEDDING_MODEL,
+      lastUpdatedAt: this.lastUpdatedAt,
       files: [...this.files.values()],
       chunks: [...this.chunks.values()],
     };
@@ -347,6 +353,7 @@ export class IndexStore {
       this.chunks.clear();
       for (const file of snapshot.files) this.files.set(file.filePath, file);
       for (const chunk of snapshot.chunks) this.chunks.set(chunk.id, chunk);
+      if (snapshot.lastUpdatedAt) this.lastUpdatedAt = snapshot.lastUpdatedAt;
       return true;
     } catch {
       return false; // corrupt/unreadable snapshot, fall back to a fresh index

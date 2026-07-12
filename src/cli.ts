@@ -19,13 +19,23 @@ const portArg = rest.find((a) => a.startsWith('--port='));
 const port = portArg ? Number(portArg.slice('--port='.length)) : 7621;
 const tokenArg = rest.find((a) => a.startsWith('--token='));
 
+/** Ensures the daemon's own folder can never be committed to the user's
+ *  repo — it holds the index snapshot and the plaintext HTTP auth token.
+ *  Self-protecting via an ignore-everything .gitignore inside the folder,
+ *  so it works even if the repo's own .gitignore doesn't mention it. */
+function ensureDaemonDirIgnored(): void {
+  fs.mkdirSync(daemonDir, { recursive: true });
+  const gitignore = path.join(daemonDir, '.gitignore');
+  if (!fs.existsSync(gitignore)) fs.writeFileSync(gitignore, '*\n', 'utf-8');
+}
+
 /** A stable per-repo token, generated once and reused across restarts so
  *  client configs don't need updating every time the daemon restarts. */
 function loadOrCreateToken(): string {
   if (tokenArg) return tokenArg.slice('--token='.length);
   if (fs.existsSync(tokenPath)) return fs.readFileSync(tokenPath, 'utf-8').trim();
   const token = randomUUID();
-  fs.mkdirSync(daemonDir, { recursive: true });
+  ensureDaemonDirIgnored();
   fs.writeFileSync(tokenPath, token, 'utf-8');
   return token;
 }
@@ -45,6 +55,9 @@ function debouncedSaver(store: InstanceType<typeof IndexStore>, delayMs = 2000) 
 
 async function main() {
   const store = new IndexStore();
+  if (command === 'index' || command === 'watch' || command === 'mcp') {
+    ensureDaemonDirIgnored();
+  }
 
   if (command === 'index') {
     const loaded = store.load(snapshotPath);
