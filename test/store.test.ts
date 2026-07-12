@@ -60,6 +60,32 @@ test('search returns nothing for a query with no lexical or semantic match', asy
   assert.equal(results.length, 0);
 });
 
+test('relevance gate: two distinct query words in one chunk match; a single incidental word does not', async () => {
+  const store = new IndexStore();
+  // No embeddings on these chunks, so this exercises the lexical gate only.
+  store.upsertFile(
+    'orders.ts',
+    'h1',
+    [chunk({ symbolName: 'cancelOrder', code: 'function cancelOrder(order) { /* cancel this order */ }' })],
+    'x'
+  );
+  store.upsertFile(
+    'misc.ts',
+    'h2',
+    [chunk({ symbolName: 'process', code: 'function process(x) { return x; }', id: 'misc.ts::process' })],
+    'x'
+  );
+
+  // "cancel order" — two distinct content words present in cancelOrder.
+  const hit = await store.search('cancel order');
+  assert.ok(hit.some((r) => r.symbolName === 'cancelOrder'));
+
+  // "process refunds now" — only the incidental word "process" appears
+  // anywhere, and "refunds" exists nowhere, so nothing should match.
+  const miss = await store.search('process refunds now');
+  assert.equal(miss.length, 0);
+});
+
 test('whole-file fallback chunks are ranked below a real symbol match on the same terms', async () => {
   const store = new IndexStore();
   store.upsertFile(

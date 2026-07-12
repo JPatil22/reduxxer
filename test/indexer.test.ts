@@ -66,6 +66,19 @@ test('parseFile chunk ids are unique and derived from filePath + symbolName', ()
   assert.equal(chunks[1].id, 'src/a.ts::bar');
 });
 
+test('parseFile emits a module chunk with imports and top-level constants', () => {
+  const chunks = parseFile(
+    'cli.ts',
+    "import path from 'node:path';\nimport { IndexStore } from './store.js';\n\nconst DEFAULT_PORT = 7621;\n\nexport function run() { return DEFAULT_PORT; }\n"
+  );
+  const mod = chunks.find((c) => c.kind === 'module');
+  assert.ok(mod, 'a module chunk should be emitted');
+  assert.match(mod.code, /import .* from 'node:path'/);
+  assert.match(mod.code, /DEFAULT_PORT = 7621/);
+  // the function is still its own chunk, not swallowed into the module chunk
+  assert.ok(chunks.some((c) => c.kind === 'function' && c.symbolName === 'run'));
+});
+
 test('parseFile extracts functions from a Vue SFC <script> block', () => {
   const sfc = [
     '<template>',

@@ -54,15 +54,24 @@ export class IndexStore {
     return [...this.chunks.values()];
   }
 
+  /** Content words from a query — drops short tokens and common filler so a
+   *  single letter like "a" in "render a chart" can't match every chunk and
+   *  inflate lexical relevance. */
+  private queryTerms(query: string): string[] {
+    return query
+      .toLowerCase()
+      .split(/\W+/)
+      .filter((t) => t.length >= 3 && !IndexStore.STOPWORDS.has(t));
+  }
+
   /** Lexical relevance score: keyword hits normalized by chunk size, with a
    *  bonus for symbol-name matches and a penalty for whole-file fallback
    *  chunks. Returns 0 for no match. */
   private lexicalScore(query: string, chunk: CodeChunk): number {
-    const terms = query.toLowerCase().split(/\W+/).filter(Boolean);
+    const terms = this.queryTerms(query);
     const haystack = (chunk.symbolName + ' ' + chunk.code).toLowerCase();
     let rawScore = 0;
     for (const term of terms) {
-      if (!term) continue;
       if (chunk.symbolName.toLowerCase().includes(term)) rawScore += 5;
       rawScore += haystack.split(term).length - 1;
     }
@@ -87,6 +96,8 @@ export class IndexStore {
     const chunks = this.allChunks();
     const hasEmbeddings = chunks.some((c) => c.embedding);
     const queryEmbedding = hasEmbeddings ? await embedText(query) : null;
+    const normalizedQuery = query.toLowerCase().trim();
+    const terms = this.queryTerms(query);
 
     const scored = chunks.map((chunk) => {
       const lexical = this.lexicalScore(query, chunk);
@@ -95,17 +106,47 @@ export class IndexStore {
       // Semantic similarity (0-1) drives ranking; lexical score is a smaller
       // additive boost so exact identifier/keyword matches still float up.
       const score = semantic + lexical * 0.05;
-      return { chunk, score, matched: semantic > 0 || lexical > 0 };
+
+      // Relevance gate — a chunk counts as a real match if ANY of:
+      //  - the whole query is a substring of the symbol name (exact lookup);
+      //  - it clears the semantic floor (strong meaning match);
+      //  - it contains at least two distinct query content-words (real
+      //    lexical overlap concentrated in one chunk, which rescues genuine
+      //    matches that score low semantically in tiny repos).
+      // A query for functionality that doesn't exist shares at most one
+      // incidental word and has low similarity, so it clears none of these
+      // and returns nothing instead of the nearest wrong chunk.
+      const haystack = (chunk.symbolName + ' ' + chunk.code).toLowerCase();
+      const distinctTerms = terms.filter((t) => haystack.includes(t)).length;
+      const nameHit = normalizedQuery.length > 0 && chunk.symbolName.toLowerCase().includes(normalizedQuery);
+      const relevant =
+        nameHit || (queryEmbedding !== null && semantic >= IndexStore.SEMANTIC_FLOOR) || distinctTerms >= 2;
+      return { chunk, score, relevant };
     });
 
     const results = scored
-      .filter((s) => s.matched)
+      .filter((s) => s.relevant)
       .sort((a, b) => b.score - a.score)
       .slice(0, limit)
       .map((s) => s.chunk);
 
     return this.expandWithReferences(results);
   }
+
+  // Minimum cosine similarity for a chunk to count as a semantic match. A
+  // chunk below this can still match if a real query word appears in it
+  // (see search) — semantic alone can't tell a genuine match in a tiny repo
+  // from an absent query, but "no query word present AND low similarity"
+  // reliably means nothing relevant.
+  private static readonly SEMANTIC_FLOOR = 0.3;
+
+  // Common filler words dropped from lexical matching so they don't create
+  // spurious hits (a query is natural language, not just identifiers).
+  private static readonly STOPWORDS = new Set([
+    'the', 'and', 'for', 'are', 'was', 'this', 'that', 'with', 'from', 'what', 'where', 'when',
+    'why', 'how', 'does', 'did', 'has', 'have', 'its', 'you', 'your', 'into', 'not', 'but', 'can',
+    'will', 'all', 'any', 'out', 'get', 'got', 'let', 'via', 'per', 'off',
+  ]);
 
   private static readonly RESOLVE_EXTS = ['.ts', '.tsx', '.js', '.jsx', '.vue', '.svelte', '.py'];
   // Directory-as-module entry points: JS/TS resolve `./dir` to dir/index.*,

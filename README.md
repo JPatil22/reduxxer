@@ -166,6 +166,20 @@ identifier searches work well. Whole-file fallback chunks (files with no
 top-level function/class match) and test files are de-prioritized/excluded
 so they don't drown out real symbol matches.
 
+Alongside functions and classes, each file also produces a **module-header
+chunk** — its imports, re-exports, top-level constants/config, and type
+declarations. This is the file-level wiring that isn't a function or class,
+so questions like "what does this file import" or "what's the default port"
+(a top-level constant) resolve instead of forcing a whole-file read.
+
+A **relevance gate** keeps results honest: a chunk only counts as a match if
+the query is a substring of its symbol name, or it clears a semantic
+similarity floor, or at least two distinct query words actually appear in
+it. A query for functionality that doesn't exist shares at most one
+incidental word and scores low, so it returns *nothing* rather than
+confidently handing back the nearest wrong chunk — and the caller can then
+fall back to reading a file.
+
 At index time, each chunk records which other symbols it calls — both
 same-file (e.g. `processPayment` calling `validateCard`) and, for JS/TS,
 symbols imported from another file (`import { validateUser } from './auth'`).

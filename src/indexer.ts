@@ -232,6 +232,37 @@ export function parseFile(filePath: string, content: string): CodeChunk[] {
     if (externalRefs.length > 0) chunk.externalRefs = externalRefs;
   }
 
+  // Module-header chunk: imports, re-exports, top-level constants/config, and
+  // type/enum declarations — the file-level wiring that isn't a function or
+  // class. Without this, questions like "what does this file import" or
+  // "what's the default port" (a top-level const) match nothing, forcing a
+  // full-file read. Additive and small, so it doesn't crowd real symbols.
+  const headerParts: string[] = [];
+  for (const stmt of sourceFile.statements) {
+    if (ts.isImportDeclaration(stmt) || ts.isExportDeclaration(stmt)) {
+      headerParts.push(stmt.getText(sourceFile));
+    } else if (ts.isVariableStatement(stmt)) {
+      const isFn = stmt.declarationList.declarations.some(
+        (d) => d.initializer && (ts.isArrowFunction(d.initializer) || ts.isFunctionExpression(d.initializer))
+      );
+      if (!isFn) headerParts.push(stmt.getText(sourceFile));
+    } else if (ts.isTypeAliasDeclaration(stmt) || ts.isEnumDeclaration(stmt)) {
+      headerParts.push(stmt.getText(sourceFile));
+    }
+  }
+  if (headerParts.length > 0) {
+    chunks.push({
+      id: `${filePath}::__module__`,
+      filePath,
+      symbolName: '__module__',
+      kind: 'module',
+      startLine: 1 + lineOffset,
+      endLine: lines.length + lineOffset,
+      code: headerParts.join('\n'),
+      fileHash,
+    });
+  }
+
   if (chunks.length === 0 && codeToParse.trim().length > 0) {
     chunks.push({
       id: `${filePath}::__file__`,

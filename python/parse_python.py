@@ -121,6 +121,30 @@ def main() -> None:
     top_level_names = {node.name for node in defs}
 
     chunks = []
+
+    # Module-header chunk: the top-of-file region (imports + module-level
+    # constants/config) before the first def, so "what does this import" and
+    # top-level config questions have something to match instead of forcing a
+    # whole-file read.
+    header_end = (min(node_start(d) for d in defs) - 1) if defs else 0
+    header_stmts = [
+        n
+        for n in tree.body
+        if isinstance(n, (ast.Import, ast.ImportFrom, ast.Assign, ast.AnnAssign))
+        and (header_end == 0 or n.lineno <= header_end)
+    ]
+    if header_stmts:
+        end = header_end if header_end > 0 else max(n.end_lineno for n in header_stmts)
+        chunks.append(
+            {
+                "name": "__module__",
+                "kind": "module",
+                "start": 1,
+                "end": end,
+                "references": [],
+                "external": [],
+            }
+        )
     for node in defs:
         if isinstance(node, ast.ClassDef):
             chunks.extend(emit_class(node, top_level_names, imports))
