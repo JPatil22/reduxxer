@@ -1,10 +1,6 @@
 import ts from 'typescript';
-import crypto from 'node:crypto';
 import { CodeChunk } from './types.js';
-
-function hashContent(content: string): string {
-  return crypto.createHash('sha1').update(content).digest('hex');
-}
+import { hashContent } from './hash.js';
 
 const SCRIPT_BLOCK = /<script[^>]*>([\s\S]*?)<\/script>/i;
 

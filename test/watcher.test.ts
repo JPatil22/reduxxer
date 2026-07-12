@@ -52,6 +52,19 @@ test('indexRepo excludes test files by default', async () => {
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
+test('indexRepo picks up a Python file via the same walk as JS/TS', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'context-daemon-python-'));
+  fs.writeFileSync(path.join(tmpDir, 'orders.py'), 'def cancel_order(order_id):\n    pass\n');
+  fs.writeFileSync(path.join(tmpDir, 'test_orders.py'), 'def test_cancel():\n    pass\n');
+
+  const store = new IndexStore();
+  await indexRepo(store, tmpDir);
+  assert.equal(store.stats().files, 1); // test_orders.py excluded
+  assert.equal(store.allChunks()[0].symbolName, 'cancel_order');
+
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
 test('re-indexing an unchanged repo skips re-parsing (hash-based skip)', async () => {
   const store = new IndexStore();
   await indexRepo(store, fixtureRepo);

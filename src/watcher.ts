@@ -1,17 +1,24 @@
 import chokidar from 'chokidar';
 import fs from 'node:fs';
 import path from 'node:path';
-import crypto from 'node:crypto';
 import ignoreLib, { type Ignore } from 'ignore';
 import { IndexStore } from './store.js';
 import { parseFile } from './indexer.js';
+import { parsePythonFile } from './pythonIndexer.js';
 import { embedText } from './embeddings.js';
+import { hashContent } from './hash.js';
+import { CodeChunk } from './types.js';
 
-const EXTENSIONS = new Set(['.ts', '.tsx', '.js', '.jsx', '.vue', '.svelte']);
+const EXTENSIONS = new Set(['.ts', '.tsx', '.js', '.jsx', '.vue', '.svelte', '.py']);
 
 /** Test files add noise to search results (huge files, no real symbols to
  *  target) without being what someone means by "give me the relevant code". */
-const TEST_FILE_PATTERN = /(\.(test|spec)\.[jt]sx?$)|([\\/](__tests__|test|tests)[\\/])/;
+const TEST_FILE_PATTERN =
+  /(\.(test|spec)\.[jt]sx?$)|([\\/](__tests__|test|tests)[\\/])|([\\/]test_[^\\/]+\.py$)|(_test\.py$)/;
+
+function parseByExtension(filePath: string, content: string): CodeChunk[] {
+  return filePath.endsWith('.py') ? parsePythonFile(filePath, content) : parseFile(filePath, content);
+}
 
 /** Sane baseline ignores, applied even if the repo has no .gitignore (or
  *  one that doesn't cover build output). Real repos also get whatever
@@ -19,7 +26,20 @@ const TEST_FILE_PATTERN = /(\.(test|spec)\.[jt]sx?$)|([\\/](__tests__|test|tests
  *  package that ships both src/ and a compiled dist/ of the same code. */
 function loadIgnore(rootDir: string): Ignore {
   const ig = ignoreLib();
-  ig.add(['node_modules', '.git', 'dist', 'build', '.next', 'coverage', '.context-daemon']);
+  ig.add([
+    'node_modules',
+    '.git',
+    'dist',
+    'build',
+    '.next',
+    'coverage',
+    '.context-daemon',
+    '__pycache__',
+    '.venv',
+    'venv',
+    '.pytest_cache',
+    '*.egg-info',
+  ]);
   try {
     ig.add(fs.readFileSync(path.join(rootDir, '.gitignore'), 'utf-8'));
   } catch {
@@ -37,10 +57,6 @@ function isIndexable(filePath: string): boolean {
   return EXTENSIONS.has(path.extname(filePath)) && !TEST_FILE_PATTERN.test(filePath);
 }
 
-function hashContent(content: string): string {
-  return crypto.createHash('sha1').update(content).digest('hex');
-}
-
 /** Truncated text fed to the embedding model — it has a small context window
  *  anyway, and the symbol name plus the first chunk of code is enough to
  *  capture what a chunk is about for semantic matching. */
@@ -54,7 +70,7 @@ export async function indexFile(store: IndexStore, filePath: string): Promise<vo
     const content = fs.readFileSync(filePath, 'utf-8');
     const hash = hashContent(content);
     if (store.getFileHash(filePath) === hash) return; // unchanged, skip
-    const chunks = parseFile(filePath, content);
+    const chunks = parseByExtension(filePath, content);
     for (const chunk of chunks) {
       chunk.embedding = await embedText(embeddingInput(chunk.symbolName, chunk.code));
     }

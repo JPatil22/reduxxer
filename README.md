@@ -1,10 +1,10 @@
 # context-daemon
 
-A local daemon that incrementally indexes a JS/TS repo (including React,
-Vue, and Svelte components) at the function/class level and serves
-**targeted** code context over MCP — instead of AI coding tools (Claude
-Code, Cursor, Cline) re-reading whole files or the whole repo on every
-request.
+A local daemon that incrementally indexes a repo (JS/TS — including React,
+Vue, and Svelte components — plus Python) at the function/class level and
+serves **targeted** code context over MCP — instead of AI coding tools
+(Claude Code, Cursor, Cline) re-reading whole files or the whole repo on
+every request.
 
 ## Why
 
@@ -33,16 +33,21 @@ context-daemon/
   src/
     types.ts        - CodeChunk / FileRecord / SearchLogEntry shapes
     store.ts         - in-memory index, persistence, lexical+semantic search, token-savings tracking
-    indexer.ts        - parses a file into symbol-level chunks (TypeScript compiler API)
-    watcher.ts         - walks a repo once, then watches it and re-indexes only changed files
-    embeddings.ts        - local embedding model (all-MiniLM-L6-v2 via @xenova/transformers)
-    mcpServer.ts           - exposes search_context / get_index_stats / get_token_savings as MCP tools
-    httpServer.ts            - Streamable HTTP transport so multiple clients share one daemon
-    cli.ts                     - entrypoint: index | watch | mcp [--http --port=N]
+    indexer.ts        - parses JS/TS/Vue/Svelte into symbol-level chunks (TypeScript compiler API)
+    pythonIndexer.ts    - parses Python into symbol-level chunks (Python's own `ast`, via subprocess)
+    watcher.ts             - walks a repo once, then watches it and re-indexes only changed files
+    embeddings.ts             - local embedding model (all-MiniLM-L6-v2 via @xenova/transformers)
+    mcpServer.ts                 - exposes search_context / get_index_stats / get_token_savings as MCP tools
+    httpServer.ts                   - Streamable HTTP transport so multiple clients share one daemon
+    cli.ts                             - entrypoint: index | watch | mcp [--http --port=N]
+  python/
+    parse_python.py    - the ast-based parser invoked by pythonIndexer.ts
   demo/
     fixture-repo/    - tiny sample repo (auth.ts, orders.ts, notifications.ts)
     benchmark.ts      - naive full-dump vs targeted search_context token comparison
     *-check.mjs        - scripts used to validate multi-client sharing, token tracking, semantic search
+  test/
+    *.test.ts          - automated test suite (node:test)
 ```
 
 ## Setup
@@ -130,9 +135,14 @@ so they don't drown out real symbol matches.
 
 ## Known limitations
 
-- JS/TS-family languages only, via the TypeScript compiler API: plain
-  `.js`/`.ts`/`.jsx`/`.tsx`, and the `<script>` block of Vue (`.vue`) and
-  Svelte (`.svelte`) single-file components. No Python/Go/Rust support yet.
+- Supported languages: JS/TS-family (`.js`/`.ts`/`.jsx`/`.tsx`, plus the
+  `<script>` block of Vue/Svelte single-file components) via the
+  TypeScript compiler API, and Python (`.py`) via Python's own `ast`
+  module. No Go/Rust/Java support yet.
+- Python support requires a `python3` or `python` interpreter on PATH —
+  `.py` files are silently skipped (with a one-time warning) if neither
+  is found. Only top-level functions/classes are extracted, same
+  granularity as the JS/TS side (a class chunk includes its methods).
 - Embedding every chunk at index time is CPU-bound and not fast — expect
   tens of milliseconds per chunk on first index of a large repo. Persistence
   means this cost is only paid once per file, not on every restart.
@@ -142,8 +152,7 @@ so they don't drown out real symbol matches.
 
 ## Suggested next steps
 
-- Python support (parse via a small subprocess around Python's `ast`
-  module, since there's no TS-compiler-API equivalent).
 - Persist the token-savings log alongside the index snapshot.
 - Batch/parallelize embedding calls during indexing to speed up first-time
   indexing of large repos.
+- Package for `npx context-daemon` / global install instead of clone + build.
