@@ -26,9 +26,10 @@ export interface FileRecord {
   filePath: string;
   hash: string;
   chunkIds: string[];
-  /** Full file text at index time, kept so we can estimate the naive
-   *  "would've read the whole file" token cost for savings tracking. */
-  content: string;
+  /** Estimated token count of the whole file at index time — the naive
+   *  "would've read the whole file" baseline for savings tracking. We keep
+   *  only this number, not the full text, to bound memory on large repos. */
+  tokens: number;
 }
 
 export interface SearchLogEntry {

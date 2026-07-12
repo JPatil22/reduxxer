@@ -75,7 +75,7 @@ export class IndexStore {
       this.chunks.set(chunk.id, chunk);
       chunkIds.push(chunk.id);
     }
-    this.files.set(filePath, { filePath, hash, chunkIds, content });
+    this.files.set(filePath, { filePath, hash, chunkIds, tokens: estimateTokens(content) });
     this.lastUpdatedAt = new Date().toISOString();
     this.bm25Dirty = true;
   }
@@ -372,8 +372,7 @@ export class IndexStore {
   trackSearch(query: string, results: CodeChunk[], targetedText?: string): SearchLogEntry {
     const touchedFiles = new Set(results.map((r) => r.filePath));
     const naiveTokens = [...touchedFiles].reduce((sum, filePath) => {
-      const content = this.files.get(filePath)?.content ?? '';
-      return sum + estimateTokens(content);
+      return sum + (this.files.get(filePath)?.tokens ?? 0);
     }, 0);
     // Measure the actual rendered output when provided (the ghost-file view),
     // so the reported savings reflect what was really sent, not just raw chunks.
