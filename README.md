@@ -101,8 +101,12 @@ many MCP clients at it as you want:
 node dist/src/cli.js mcp /path/to/a/real/repo --http --port=7621
 ```
 
-Then configure each client to connect to `http://localhost:7621/mcp` over
-Streamable HTTP. All clients read and write through the same live index.
+This binds to `127.0.0.1` only and prints a per-repo auth token (generated
+once and saved to `.context-daemon/http-token`, or set your own with
+`--token=secret`). Configure each client to connect to
+`http://127.0.0.1:7621/mcp` over Streamable HTTP with header
+`Authorization: Bearer <token>`. All clients read and write through the
+same live index.
 
 Once connected, a tool can call:
 

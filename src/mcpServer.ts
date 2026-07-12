@@ -9,7 +9,7 @@ import { IndexStore } from './store.js';
  * instead of the tool reading whole files into its own context.
  */
 export function createMcpServer(store: IndexStore) {
-  const server = new McpServer({ name: 'context-daemon', version: '0.1.0' });
+  const server = new McpServer({ name: 'context-daemon', version: '0.2.0' });
 
   server.tool(
     'search_context',

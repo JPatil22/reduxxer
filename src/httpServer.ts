@@ -16,12 +16,20 @@ import { createMcpServer } from './mcpServer.js';
  * and writes through the same shared `store`, so indexing work and results
  * are shared, not duplicated.
  */
-export async function startHttpMcpServer(store: IndexStore, port: number): Promise<void> {
+export async function startHttpMcpServer(store: IndexStore, port: number, token: string): Promise<void> {
   const sessions = new Map<string, StreamableHTTPServerTransport>();
 
   const httpServer = http.createServer(async (req, res) => {
     if (req.url !== '/mcp') {
       res.writeHead(404).end('Not found');
+      return;
+    }
+
+    const authHeader = req.headers['authorization'];
+    if (authHeader !== `Bearer ${token}`) {
+      res.writeHead(401, { 'content-type': 'application/json' }).end(
+        JSON.stringify({ error: 'Missing or invalid Authorization header' })
+      );
       return;
     }
 
@@ -64,9 +72,11 @@ export async function startHttpMcpServer(store: IndexStore, port: number): Promi
     res.writeHead(405).end('Method not allowed');
   });
 
-  await new Promise<void>((resolve) => httpServer.listen(port, resolve));
+  // Bind to loopback only — this is meant for local tools on this machine,
+  // not to be reachable from the network.
+  await new Promise<void>((resolve) => httpServer.listen(port, '127.0.0.1', resolve));
   console.error(
-    `context-daemon MCP server listening on http://localhost:${port}/mcp\n` +
-      `Point multiple clients (Claude Code, Cursor, ...) at this same URL to share one index.`
+    `context-daemon MCP server listening on http://127.0.0.1:${port}/mcp\n` +
+      `Point multiple MCP clients at this same URL (with header "Authorization: Bearer ${token}") to share one index.`
   );
 }
