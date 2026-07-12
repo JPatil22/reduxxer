@@ -6,11 +6,35 @@ import { pipeline, type FeatureExtractionPipeline } from '@xenova/transformers';
 export const EMBEDDING_MODEL = 'Xenova/all-MiniLM-L6-v2';
 
 let embedderPromise: Promise<FeatureExtractionPipeline> | null = null;
+let embeddingsEnabled = true;
+
+/** Turns off embeddings entirely (lexical-only mode) — no model download,
+ *  no inference. Search still works via the lexical relevance gate. */
+export function disableEmbeddings(): void {
+  embeddingsEnabled = false;
+}
+
+export function setEmbeddingsEnabled(enabled: boolean): void {
+  embeddingsEnabled = enabled;
+}
+
+export function embeddingsAreEnabled(): boolean {
+  return embeddingsEnabled;
+}
 
 function getEmbedder(): Promise<FeatureExtractionPipeline> {
   if (!embedderPromise) {
-    // Downloads and caches the model on first call (~90MB, one time).
-    embedderPromise = pipeline('feature-extraction', EMBEDDING_MODEL) as Promise<FeatureExtractionPipeline>;
+    // The model is downloaded and cached on first use (~90MB). Announce it
+    // so the first run isn't a silent multi-minute hang.
+    console.error(
+      `context-daemon: loading local embedding model (${EMBEDDING_MODEL}); first run downloads ~90MB, cached afterwards...`
+    );
+    embedderPromise = (pipeline('feature-extraction', EMBEDDING_MODEL) as Promise<FeatureExtractionPipeline>).then(
+      (p) => {
+        console.error('context-daemon: embedding model ready.');
+        return p;
+      }
+    );
   }
   return embedderPromise;
 }
@@ -18,6 +42,7 @@ function getEmbedder(): Promise<FeatureExtractionPipeline> {
 /** Embeds text into a normalized vector. Truncate long inputs by the caller
  *  to keep inference fast — this model has a 256-token context window anyway. */
 export async function embedText(text: string): Promise<number[]> {
+  if (!embeddingsEnabled) return [];
   const embedder = await getEmbedder();
   const output = await embedder(text, { pooling: 'mean', normalize: true });
   return Array.from(output.data as Float32Array);
@@ -35,6 +60,7 @@ export async function embedText(text: string): Promise<number[]> {
  * that, and so a future GPU/native runtime swap has one place to change.
  */
 export async function embedTexts(texts: string[]): Promise<number[][]> {
+  if (!embeddingsEnabled) return [];
   const vectors: number[][] = [];
   for (const text of texts) {
     vectors.push(await embedText(text));

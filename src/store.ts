@@ -66,7 +66,7 @@ export class IndexStore {
     return query
       .toLowerCase()
       .split(/\W+/)
-      .filter((t) => t.length >= 3 && !IndexStore.STOPWORDS.has(t));
+      .filter((t) => t.length >= 2 && !IndexStore.STOPWORDS.has(t));
   }
 
   /** Lexical relevance score: keyword hits normalized by chunk size, with a
@@ -146,11 +146,14 @@ export class IndexStore {
   private static readonly SEMANTIC_FLOOR = 0.3;
 
   // Common filler words dropped from lexical matching so they don't create
-  // spurious hits (a query is natural language, not just identifiers).
+  // spurious hits (a query is natural language, not just identifiers). Kept
+  // to genuine filler so short identifiers like id/db/ui/fs still count.
   private static readonly STOPWORDS = new Set([
     'the', 'and', 'for', 'are', 'was', 'this', 'that', 'with', 'from', 'what', 'where', 'when',
     'why', 'how', 'does', 'did', 'has', 'have', 'its', 'you', 'your', 'into', 'not', 'but', 'can',
     'will', 'all', 'any', 'out', 'get', 'got', 'let', 'via', 'per', 'off',
+    'is', 'of', 'to', 'in', 'on', 'at', 'by', 'or', 'if', 'we', 'do', 'an', 'as', 'be', 'it', 'so',
+    'no', 'up', 'my', 'me',
   ]);
 
   private static readonly RESOLVE_EXTS = ['.ts', '.tsx', '.js', '.jsx', '.vue', '.svelte', '.py'];

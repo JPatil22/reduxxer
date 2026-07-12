@@ -215,7 +215,9 @@ real matches. Cross-file resolution covers JS/TS relative imports and Python
   (batching many chunks into one model call was tried and measured slower
   on this CPU/ONNX runtime, due to padding overhead across variable-length
   chunks — see the comment on `embedTexts` in `embeddings.ts`). Persistence
-  means this cost is only paid once per file, not on every restart.
+  means this cost is only paid once per file, not on every restart. Pass
+  `--no-embeddings` to skip the model entirely (no ~90MB download, lexical
+  search only). On first run the model download is announced, not silent.
 - Search is brute-force cosine similarity over every embedded chunk — fine
   at the thousands-of-chunks scale this has been tested at, not verified
   at tens-of-thousands-of-chunks monorepo scale.

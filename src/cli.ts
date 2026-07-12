@@ -6,8 +6,13 @@ import { IndexStore } from './store.js';
 import { indexRepo, watchRepo } from './watcher.js';
 import { startMcpServer } from './mcpServer.js';
 import { startHttpMcpServer } from './httpServer.js';
+import { disableEmbeddings } from './embeddings.js';
 
 const [, , command, ...rest] = process.argv;
+if (rest.includes('--no-embeddings')) {
+  disableEmbeddings();
+  console.error('context-daemon: --no-embeddings set — lexical-only search, no model download.');
+}
 // Resolve to absolute so the snapshot location and the indexed file paths
 // are canonical no matter whether the repo was passed as "." or a full path.
 const repoPath = path.resolve(rest.find((a) => !a.startsWith('--')) ?? process.cwd());
@@ -108,6 +113,10 @@ async function main() {
                                                  generated once and saved to .context-daemon/http-token
                                                  (or pass --token= to set your own); clients must send
                                                  it as "Authorization: Bearer <token>".
+
+  --no-embeddings  (any command)                 Skip the embedding model entirely: no ~90MB download,
+                                                 no inference. Search falls back to lexical-only — faster
+                                                 to start, but no semantic/paraphrase matching.
 `);
 }
 

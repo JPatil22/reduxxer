@@ -114,6 +114,19 @@ test('search returns nothing for a query with no lexical or semantic match', asy
   assert.equal(results.length, 0);
 });
 
+test('short identifiers like "id" and "db" are not dropped from matching', async () => {
+  const store = new IndexStore();
+  store.upsertFile(
+    'db.ts',
+    'h',
+    [chunk({ symbolName: 'getUserById', code: 'function getUserById(id) { return db.find(id); }', id: 'db.ts::getUserById' })],
+    'x'
+  );
+  // "user id" — both short-ish content words present in getUserById.
+  const results = await store.search('user id');
+  assert.ok(results.some((r) => r.symbolName === 'getUserById'));
+});
+
 test('relevance gate: two distinct query words in one chunk match; a single incidental word does not', async () => {
   const store = new IndexStore();
   // No embeddings on these chunks, so this exercises the lexical gate only.
