@@ -52,6 +52,15 @@ export class IndexStore {
   // Actual time the index last changed — not "now" on every stats() call.
   private lastUpdatedAt = new Date().toISOString();
 
+  // BM25 corpus statistics, rebuilt lazily when the index changes. Per-chunk
+  // term frequencies + lengths, per-term document frequency, and the average
+  // document length — everything BM25 needs to weight rare terms higher and
+  // saturate repeated ones, instead of the old raw keyword count.
+  private bm25Docs = new Map<string, { tf: Map<string, number>; len: number }>();
+  private bm25Df = new Map<string, number>();
+  private bm25Avgdl = 1;
+  private bm25Dirty = true;
+
   getFileHash(filePath: string): string | undefined {
     return this.files.get(filePath)?.hash;
   }
@@ -68,6 +77,7 @@ export class IndexStore {
     }
     this.files.set(filePath, { filePath, hash, chunkIds, content });
     this.lastUpdatedAt = new Date().toISOString();
+    this.bm25Dirty = true;
   }
 
   removeFile(filePath: string): void {
@@ -76,6 +86,7 @@ export class IndexStore {
       for (const id of old.chunkIds) this.chunks.delete(id);
       this.files.delete(filePath);
       this.lastUpdatedAt = new Date().toISOString();
+      this.bm25Dirty = true;
     }
   }
 
@@ -93,20 +104,57 @@ export class IndexStore {
       .filter((t) => t.length >= 2 && !IndexStore.STOPWORDS.has(t));
   }
 
-  /** Lexical relevance score: keyword hits normalized by chunk size, with a
-   *  bonus for symbol-name matches and a penalty for whole-file fallback
-   *  chunks. Returns 0 for no match. */
-  private lexicalScore(query: string, chunk: CodeChunk): number {
-    const terms = this.queryTerms(query);
-    const haystack = (chunk.symbolName + ' ' + chunk.code).toLowerCase();
-    let rawScore = 0;
-    for (const term of terms) {
-      if (chunk.symbolName.toLowerCase().includes(term)) rawScore += 5;
-      rawScore += haystack.split(term).length - 1;
+  // BM25 tuning: k1 controls term-frequency saturation, b controls how much
+  // long documents are penalized. These are the standard defaults.
+  private static readonly BM25_K1 = 1.5;
+  private static readonly BM25_B = 0.75;
+
+  /** Tokenizes code/text for BM25: splits on non-alphanumerics and camelCase
+   *  boundaries so `getUserById` contributes get/user/by/id, lowercased. No
+   *  stopword filtering — BM25's IDF down-weights common words on its own. */
+  private tokenize(text: string): string[] {
+    return text
+      .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+      .toLowerCase()
+      .split(/[^a-z0-9]+/)
+      .filter((t) => t.length >= 2);
+  }
+
+  /** Rebuilds BM25 corpus statistics from the current chunks. Lazy: only
+   *  runs when the index has changed since the last search. */
+  private rebuildBm25(): void {
+    this.bm25Docs.clear();
+    this.bm25Df.clear();
+    let totalLen = 0;
+    for (const chunk of this.chunks.values()) {
+      const tokens = this.tokenize(`${chunk.symbolName} ${chunk.code}`);
+      const tf = new Map<string, number>();
+      for (const t of tokens) tf.set(t, (tf.get(t) ?? 0) + 1);
+      this.bm25Docs.set(chunk.id, { tf, len: tokens.length });
+      totalLen += tokens.length;
+      for (const term of tf.keys()) this.bm25Df.set(term, (this.bm25Df.get(term) ?? 0) + 1);
     }
-    const sizeFactor = Math.sqrt(Math.max(chunk.code.length, 1));
-    const kindPenalty = chunk.kind === 'file' ? 0.3 : 1;
-    return (rawScore / sizeFactor) * kindPenalty;
+    this.bm25Avgdl = this.bm25Docs.size > 0 ? totalLen / this.bm25Docs.size : 1;
+    this.bm25Dirty = false;
+  }
+
+  /** BM25 relevance score of one chunk for the given query tokens. Rare query
+   *  terms (low document frequency) count for more; repeated terms saturate;
+   *  long documents are length-normalized. Returns 0 for no term overlap. */
+  private bm25Score(queryTokens: string[], chunkId: string): number {
+    const doc = this.bm25Docs.get(chunkId);
+    if (!doc) return 0;
+    const n = this.bm25Docs.size;
+    const { BM25_K1: k1, BM25_B: b } = IndexStore;
+    let score = 0;
+    for (const term of queryTokens) {
+      const f = doc.tf.get(term);
+      if (!f) continue;
+      const df = this.bm25Df.get(term) ?? 0;
+      const idf = Math.log(1 + (n - df + 0.5) / (df + 0.5));
+      score += idf * ((f * (k1 + 1)) / (f + k1 * (1 - b + (b * doc.len) / this.bm25Avgdl)));
+    }
+    return score;
   }
 
   /**
@@ -122,19 +170,32 @@ export class IndexStore {
    * results stay grounded in what the query actually matched.
    */
   async search(query: string, limit = 5): Promise<CodeChunk[]> {
+    if (this.bm25Dirty) this.rebuildBm25();
     const chunks = this.allChunks();
     const hasEmbeddings = chunks.some((c) => c.embedding);
     const queryEmbedding = hasEmbeddings ? await embedText(query) : null;
     const normalizedQuery = query.toLowerCase().trim();
     const terms = this.queryTerms(query);
+    const queryTokens = this.tokenize(query);
 
-    const scored = chunks.map((chunk) => {
-      const lexical = this.lexicalScore(query, chunk);
+    // BM25 scores are unbounded and corpus-dependent, so normalize them to
+    // [0,1] within this query (top lexical hit = 1) before blending with the
+    // semantic score, which is already [0,1].
+    const bm25Raw = chunks.map((c) => this.bm25Score(queryTokens, c.id));
+    const bm25Max = Math.max(0, ...bm25Raw);
+
+    const scored = chunks.map((chunk, i) => {
+      // Normalized BM25, with a penalty for whole-file fallback chunks — a
+      // giant file stuffed with repeated terms shouldn't outrank the real
+      // function that answers, which BM25 length-normalization alone doesn't
+      // fully prevent.
+      const kindPenalty = chunk.kind === 'file' ? 0.3 : 1;
+      const lexical = (bm25Max > 0 ? bm25Raw[i] / bm25Max : 0) * kindPenalty;
       const semantic =
         queryEmbedding && chunk.embedding ? cosineSimilarity(queryEmbedding, chunk.embedding) : 0;
-      // Semantic similarity (0-1) drives ranking; lexical score is a smaller
-      // additive boost so exact identifier/keyword matches still float up.
-      const score = semantic + lexical * 0.05;
+      // Semantic similarity (0-1) drives ranking; normalized BM25 (0-1) is a
+      // smaller additive boost so exact identifier/keyword matches still surface.
+      const score = semantic + lexical * 0.2;
 
       // Relevance gate — a chunk counts as a real match if ANY of:
       //  - the whole query is a substring of the symbol name (exact lookup);

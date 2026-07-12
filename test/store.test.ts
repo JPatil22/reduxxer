@@ -114,6 +114,31 @@ test('search returns nothing for a query with no lexical or semantic match', asy
   assert.equal(results.length, 0);
 });
 
+test('BM25 ranking: a chunk with a rare query term outranks ones sharing only common terms', async () => {
+  const store = new IndexStore();
+  // Filler chunks make "foo" and "bar" common (high document frequency).
+  for (let i = 0; i < 5; i++) {
+    store.upsertFile(
+      `f${i}.ts`,
+      'h',
+      [chunk({ symbolName: `filler${i}`, id: `f${i}.ts::filler${i}`, code: 'function x() { foo(); bar(); }' })],
+      'x'
+    );
+  }
+  // The target additionally contains a rare term "zebra" (df = 1).
+  store.upsertFile(
+    'target.ts',
+    'h',
+    [chunk({ symbolName: 'target', id: 'target.ts::target', code: 'function x() { foo(); bar(); zebra(); }' })],
+    'x'
+  );
+
+  // All candidates share foo+bar (pass the gate); only target has the rare
+  // "zebra", so IDF must lift it to the top.
+  const results = await store.search('foo bar zebra');
+  assert.equal(results[0].symbolName, 'target');
+});
+
 test('short identifiers like "id" and "db" are not dropped from matching', async () => {
   const store = new IndexStore();
   store.upsertFile(

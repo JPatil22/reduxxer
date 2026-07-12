@@ -159,12 +159,16 @@ Once connected, a tool can call:
 ## How search works
 
 Each indexed chunk gets a local embedding vector at index time. A query is
-embedded and ranked primarily by cosine similarity, with a lexical
-keyword/symbol-name match folded in as a smaller boost — so both
-paraphrased queries ("terminate a user's session" → `logout`) and exact
-identifier searches work well. Whole-file fallback chunks (files with no
-top-level function/class match) and test files are de-prioritized/excluded
-so they don't drown out real symbol matches.
+embedded and ranked by a hybrid of two signals: cosine similarity (semantic)
+and **BM25** (lexical). BM25 is the standard information-retrieval scorer —
+it weights rare query terms higher via IDF (so `bm25Score` surfaces for
+"bm25 ranking" but a ubiquitous word like `process` barely moves the
+ranking), saturates repeated terms, and normalizes for document length.
+Identifiers are split on camelCase (`getUserById` → get/user/by/id) so
+identifier searches work. Combining the two covers both paraphrased queries
+("terminate a user's session" → `logout`) and exact identifier lookups.
+Whole-file fallback chunks and test files are de-prioritized/excluded so
+they don't drown out real symbol matches.
 
 Alongside functions and classes, each file also produces a **module-header
 chunk** — its imports, re-exports, top-level constants/config, and type
