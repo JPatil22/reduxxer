@@ -166,13 +166,15 @@ identifier searches work well. Whole-file fallback chunks (files with no
 top-level function/class match) and test files are de-prioritized/excluded
 so they don't drown out real symbol matches.
 
-At index time, each chunk also records which other same-file top-level
-symbols it calls (e.g. `processPayment` calling `validateCard`). The top
-search match gets expanded with its direct dependencies (up to 3, labeled
-`referenced by <match>` in the output) instead of being returned in
-isolation — so asking about a function that mostly delegates to helpers
-gets you those helpers too, not just the entry point. This is same-file
-only (no cross-file import resolution) and one hop deep.
+At index time, each chunk records which other symbols it calls — both
+same-file (e.g. `processPayment` calling `validateCard`) and, for JS/TS,
+symbols imported from another file (`import { validateUser } from './auth'`).
+The top search match gets expanded with its direct dependencies instead of
+being returned in isolation — so asking about a function that delegates to
+helpers, including helpers in *other* files, gets you those too, not just
+the entry point. Expansion is one hop deep and capped so it can't dwarf the
+real matches. Cross-file resolution currently covers JS/TS relative imports;
+Python expansion is same-file only for now.
 
 ## Known limitations
 
@@ -193,9 +195,9 @@ only (no cross-file import resolution) and one hop deep.
 - Search is brute-force cosine similarity over every embedded chunk — fine
   at the thousands-of-chunks scale this has been tested at, not verified
   at tens-of-thousands-of-chunks monorepo scale.
-- Dependency expansion is same-file and one-hop only — it won't follow a
-  call into a function imported from another file, and won't chase a
-  dependency's own dependencies.
+- Dependency expansion is one-hop only (it won't chase a dependency's own
+  dependencies). Cross-file import resolution works for JS/TS relative
+  imports; Python expansion is still same-file only.
 - The HTTP transport is localhost-only with a per-repo bearer token, not
   meant to be exposed beyond the machine it runs on.
 - Token-savings tracking is session-scoped (not persisted to the snapshot).
@@ -203,5 +205,5 @@ only (no cross-file import resolution) and one hop deep.
 ## Suggested next steps
 
 - Persist the token-savings log alongside the index snapshot.
-- Cross-file dependency expansion (resolve imports, not just same-file calls).
+- Cross-file dependency expansion for Python (JS/TS is done).
 - Package for `npx context-daemon` / global install instead of clone + build.

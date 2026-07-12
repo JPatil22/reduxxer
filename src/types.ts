@@ -12,8 +12,14 @@ export interface CodeChunk {
   /** Chunk ids of other same-file symbols this chunk calls, e.g.
    *  processPayment calling validateCard records validateCard's chunk id.
    *  Used to expand a search result with its direct dependencies instead
-   *  of returning it in isolation. Same-file only — no import resolution. */
+   *  of returning it in isolation. */
   references?: string[];
+  /** Cross-file dependencies: symbols this chunk calls that are imported
+   *  from another file, stored as "<resolved-path-without-extension>::<name>"
+   *  because the exact file extension isn't known at parse time. The store
+   *  resolves these against the full index at search time (trying .ts/.tsx/
+   *  .js/... and /index) so an imported function gets pulled in too. */
+  externalRefs?: string[];
 }
 
 export interface FileRecord {

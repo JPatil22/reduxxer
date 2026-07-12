@@ -1,4 +1,5 @@
 import ts from 'typescript';
+import path from 'node:path';
 import { CodeChunk } from './types.js';
 import { hashContent } from './hash.js';
 
@@ -183,16 +184,52 @@ export function parseFile(filePath: string, content: string): CodeChunk[] {
 
   visit(sourceFile);
 
+  // Map each locally-bound imported name to the target file (resolved,
+  // without extension) and the original exported name. Only relative
+  // imports are tracked — package imports (react, lodash, ...) aren't in
+  // the index. `import { validateUser as vu } from './auth'` records
+  // vu -> { pathPrefix: <dir>/auth, originalName: validateUser }.
+  const importMap = new Map<string, { pathPrefix: string; originalName: string }>();
+  const fileDir = path.dirname(filePath);
+  for (const stmt of sourceFile.statements) {
+    if (!ts.isImportDeclaration(stmt) || !ts.isStringLiteral(stmt.moduleSpecifier)) continue;
+    const spec = stmt.moduleSpecifier.text;
+    if (!spec.startsWith('.')) continue; // only relative (in-repo) imports
+    const pathPrefix = path.resolve(fileDir, spec).replace(/\.(ts|tsx|js|jsx)$/, '');
+    const clause = stmt.importClause;
+    if (!clause) continue;
+    if (clause.name) importMap.set(clause.name.text, { pathPrefix, originalName: clause.name.text });
+    if (clause.namedBindings && ts.isNamedImports(clause.namedBindings)) {
+      for (const el of clause.namedBindings.elements) {
+        importMap.set(el.name.text, {
+          pathPrefix,
+          originalName: (el.propertyName ?? el.name).text,
+        });
+      }
+    }
+  }
+
   // Resolve called names to chunk ids now that every same-file symbol is
   // known. Self-references (recursion) are dropped — not useful context.
+  // Names that aren't same-file but are imported become cross-file refs,
+  // resolved to actual chunk ids by the store at search time.
   const nameToId = new Map(chunks.map((c) => [c.symbolName, c.id]));
   for (const chunk of chunks) {
     const calledNames = calledNamesByChunkId.get(chunk.id);
     if (!calledNames) continue;
-    const references = [...calledNames]
-      .map((n) => nameToId.get(n))
-      .filter((id): id is string => id !== undefined && id !== chunk.id);
+    const references: string[] = [];
+    const externalRefs: string[] = [];
+    for (const name of calledNames) {
+      const sameFileId = nameToId.get(name);
+      if (sameFileId && sameFileId !== chunk.id) {
+        references.push(sameFileId);
+      } else if (!sameFileId) {
+        const imported = importMap.get(name);
+        if (imported) externalRefs.push(`${imported.pathPrefix}::${imported.originalName}`);
+      }
+    }
     if (references.length > 0) chunk.references = references;
+    if (externalRefs.length > 0) chunk.externalRefs = externalRefs;
   }
 
   if (chunks.length === 0 && codeToParse.trim().length > 0) {

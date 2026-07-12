@@ -107,24 +107,50 @@ export class IndexStore {
     return this.expandWithReferences(results);
   }
 
-  /** Appends the top result's direct same-file dependencies (if not
-   *  already present), capped so expansion can't dwarf the real matches. */
+  private static readonly RESOLVE_EXTS = ['.ts', '.tsx', '.js', '.jsx', '.vue', '.svelte'];
+
+  /** Resolves a cross-file ref ("<path-without-ext>::<name>") to an actual
+   *  indexed chunk by trying each extension and an /index file, since the
+   *  exact extension isn't known when imports are recorded at parse time. */
+  private resolveExternalRef(ref: string): CodeChunk | undefined {
+    const sep = ref.lastIndexOf('::');
+    if (sep < 0) return undefined;
+    const prefix = ref.slice(0, sep);
+    const name = ref.slice(sep + 2);
+    for (const ext of IndexStore.RESOLVE_EXTS) {
+      const direct = this.chunks.get(`${prefix}${ext}::${name}`);
+      if (direct) return direct;
+    }
+    for (const ext of IndexStore.RESOLVE_EXTS) {
+      const idx = this.chunks.get(`${path.join(prefix, 'index' + ext)}::${name}`);
+      if (idx) return idx;
+    }
+    return undefined;
+  }
+
+  /** Appends the top result's direct dependencies — both same-file
+   *  (`references`) and imported-from-another-file (`externalRefs`) — if not
+   *  already present, capped so expansion can't dwarf the real matches. This
+   *  is what lets the daemon hand over an imported function alongside the
+   *  function that uses it, instead of leaving the caller to go read the
+   *  other file itself. */
   private expandWithReferences(results: CodeChunk[]): CodeChunk[] {
-    const MAX_EXPANDED = 3;
+    const MAX_EXPANDED = 4;
     const top = results[0];
-    if (!top?.references?.length) return results;
+    if (!top) return results;
 
     const alreadyIncluded = new Set(results.map((r) => r.id));
     const expanded: CodeChunk[] = [];
-    for (const refId of top.references) {
-      if (expanded.length >= MAX_EXPANDED) break;
-      if (alreadyIncluded.has(refId)) continue;
-      const refChunk = this.chunks.get(refId);
-      if (refChunk) {
-        expanded.push(refChunk);
-        alreadyIncluded.add(refId);
-      }
-    }
+
+    const addChunk = (chunk: CodeChunk | undefined) => {
+      if (!chunk || expanded.length >= MAX_EXPANDED || alreadyIncluded.has(chunk.id)) return;
+      expanded.push(chunk);
+      alreadyIncluded.add(chunk.id);
+    };
+
+    for (const refId of top.references ?? []) addChunk(this.chunks.get(refId));
+    for (const ref of top.externalRefs ?? []) addChunk(this.resolveExternalRef(ref));
+
     return [...results, ...expanded];
   }
 

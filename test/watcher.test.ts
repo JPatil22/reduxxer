@@ -81,6 +81,31 @@ test('indexing the same repo via relative and absolute paths does not duplicate 
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
+test('search pulls in a dependency imported from another file (cross-file expansion)', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'context-daemon-xfile-'));
+  fs.writeFileSync(
+    path.join(tmpDir, 'auth.ts'),
+    'export function validateUser(id: string): boolean {\n  return id.length > 0;\n}\n'
+  );
+  fs.writeFileSync(
+    path.join(tmpDir, 'orders.ts'),
+    "import { validateUser } from './auth';\n\nexport function processOrder(userId: string): void {\n  if (!validateUser(userId)) throw new Error('bad');\n}\n"
+  );
+
+  const store = new IndexStore();
+  await indexRepo(store, tmpDir);
+
+  const results = await store.search('process an order for a user', 1);
+  const names = results.map((r) => r.symbolName);
+  assert.ok(names.includes('processOrder'), 'the matched function should be returned');
+  assert.ok(
+    names.includes('validateUser'),
+    'the function imported from another file should be pulled in too'
+  );
+
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
 test('re-indexing an unchanged repo skips re-parsing (hash-based skip)', async () => {
   const store = new IndexStore();
   await indexRepo(store, fixtureRepo);
