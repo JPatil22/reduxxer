@@ -83,6 +83,12 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error(err);
+  // Known, expected failures (bad repo path, etc.) get a clean one-line
+  // message; anything unexpected still gets the full stack for debugging.
+  if (err instanceof Error && err.message.startsWith('Repo path')) {
+    console.error(`Error: ${err.message}`);
+  } else {
+    console.error(err);
+  }
   process.exit(1);
 });

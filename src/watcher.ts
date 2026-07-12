@@ -2,6 +2,7 @@ import chokidar from 'chokidar';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import ignoreLib, { type Ignore } from 'ignore';
 import { IndexStore } from './store.js';
 import { parseFile } from './indexer.js';
 import { embedText } from './embeddings.js';
@@ -11,6 +12,26 @@ const EXTENSIONS = new Set(['.ts', '.tsx', '.js', '.jsx']);
 /** Test files add noise to search results (huge files, no real symbols to
  *  target) without being what someone means by "give me the relevant code". */
 const TEST_FILE_PATTERN = /(\.(test|spec)\.[jt]sx?$)|([\\/](__tests__|test|tests)[\\/])/;
+
+/** Sane baseline ignores, applied even if the repo has no .gitignore (or
+ *  one that doesn't cover build output). Real repos also get whatever
+ *  their own .gitignore excludes — which naturally solves noise like a
+ *  package that ships both src/ and a compiled dist/ of the same code. */
+function loadIgnore(rootDir: string): Ignore {
+  const ig = ignoreLib();
+  ig.add(['node_modules', '.git', 'dist', 'build', '.next', 'coverage', '.context-daemon']);
+  try {
+    ig.add(fs.readFileSync(path.join(rootDir, '.gitignore'), 'utf-8'));
+  } catch {
+    // no .gitignore present, baseline ignores above still apply
+  }
+  return ig;
+}
+
+function isIgnored(ig: Ignore, rootDir: string, fullPath: string): boolean {
+  const rel = path.relative(rootDir, fullPath).split(path.sep).join('/');
+  return rel !== '' && ig.ignores(rel);
+}
 
 function isIndexable(filePath: string): boolean {
   return EXTENSIONS.has(path.extname(filePath)) && !TEST_FILE_PATTERN.test(filePath);
@@ -43,15 +64,23 @@ export async function indexFile(store: IndexStore, filePath: string): Promise<vo
   }
 }
 
-const IGNORE_DIRS = new Set(['node_modules', '.git', 'dist', 'build', '.next']);
-
 export async function indexRepo(store: IndexStore, rootDir: string): Promise<void> {
+  if (!fs.existsSync(rootDir)) {
+    throw new Error(`Repo path does not exist: ${rootDir}`);
+  }
+  if (!fs.statSync(rootDir).isDirectory()) {
+    throw new Error(`Repo path is not a directory: ${rootDir}`);
+  }
+
+  const ig = loadIgnore(rootDir);
+
   async function walk(dir: string) {
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
       if (entry.name.startsWith('.') && entry.name !== '.') continue;
       const full = path.join(dir, entry.name);
+      if (isIgnored(ig, rootDir, full)) continue;
       if (entry.isDirectory()) {
-        if (!IGNORE_DIRS.has(entry.name)) await walk(full);
+        await walk(full);
       } else if (isIndexable(full)) {
         await indexFile(store, full);
       }
@@ -66,8 +95,9 @@ export function watchRepo(
   rootDir: string,
   onChange?: (event: string, filePath: string) => void
 ) {
+  const ig = loadIgnore(rootDir);
   const watcher = chokidar.watch(rootDir, {
-    ignored: [/node_modules/, /\.git/, /dist/, /build/],
+    ignored: (filePath: string) => isIgnored(ig, rootDir, filePath),
     ignoreInitial: true,
     persistent: true,
   });
