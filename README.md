@@ -144,8 +144,18 @@ so they don't drown out real symbol matches.
   is found. Only top-level functions/classes are extracted, same
   granularity as the JS/TS side (a class chunk includes its methods).
 - Embedding every chunk at index time is CPU-bound and not fast — expect
-  tens of milliseconds per chunk on first index of a large repo. Persistence
+  tens of milliseconds per chunk on first index of a large repo, sequentially
+  (batching many chunks into one model call was tried and measured slower
+  on this CPU/ONNX runtime, due to padding overhead across variable-length
+  chunks — see the comment on `embedTexts` in `embeddings.ts`). Persistence
   means this cost is only paid once per file, not on every restart.
+- Search is brute-force cosine similarity over every embedded chunk — fine
+  at the thousands-of-chunks scale this has been tested at, not verified
+  at tens-of-thousands-of-chunks monorepo scale.
+- No dependency/call-graph awareness — search_context returns the best-
+  matching chunk(s) in isolation, with no expansion to functions they call.
+  A query about a function that delegates most of its logic to helpers
+  will get that function but not its dependencies.
 - The HTTP transport is localhost-only with a per-repo bearer token, not
   meant to be exposed beyond the machine it runs on.
 - Token-savings tracking is session-scoped (not persisted to the snapshot).
@@ -153,6 +163,7 @@ so they don't drown out real symbol matches.
 ## Suggested next steps
 
 - Persist the token-savings log alongside the index snapshot.
-- Batch/parallelize embedding calls during indexing to speed up first-time
-  indexing of large repos.
+- One-hop dependency expansion: record which local symbols each chunk
+  references at index time, and pull in direct references alongside the
+  top search match instead of returning it in isolation.
 - Package for `npx context-daemon` / global install instead of clone + build.

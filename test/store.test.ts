@@ -108,12 +108,12 @@ test('trackSearch computes naive vs targeted token counts and cumulative savings
   assert.equal(savings.totalSavedTokens, entry.savedTokens);
 });
 
-test('save/load round-trips the index to disk', () => {
+test('save/load round-trips the index to disk', async () => {
   const store = new IndexStore();
   store.upsertFile('a.ts', 'hash1', [chunk({})], 'function foo() {}');
 
   const tmpFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'store-test-')), 'index.json');
-  store.save(tmpFile);
+  await store.save(tmpFile);
 
   const loaded = new IndexStore();
   const ok = loaded.load(tmpFile);
@@ -121,6 +121,24 @@ test('save/load round-trips the index to disk', () => {
   assert.equal(loaded.stats().files, 1);
   assert.equal(loaded.stats().chunks, 1);
   assert.equal(loaded.getFileHash('a.ts'), 'hash1');
+});
+
+test('load refuses a snapshot written by a different embedding model', async () => {
+  const store = new IndexStore();
+  store.upsertFile('a.ts', 'hash1', [chunk({})], 'function foo() {}');
+
+  const tmpFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'store-test-model-')), 'index.json');
+  await store.save(tmpFile);
+
+  // Simulate a snapshot saved by an older/different embedding model.
+  const raw = JSON.parse(fs.readFileSync(tmpFile, 'utf-8'));
+  raw.embeddingModel = 'some-other-model';
+  fs.writeFileSync(tmpFile, JSON.stringify(raw), 'utf-8');
+
+  const loaded = new IndexStore();
+  const ok = loaded.load(tmpFile);
+  assert.equal(ok, false);
+  assert.equal(loaded.stats().files, 0);
 });
 
 test('load returns false when there is no snapshot on disk', () => {

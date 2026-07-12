@@ -2,10 +2,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { CodeChunk, FileRecord, SearchLogEntry } from './types.js';
 import { estimateTokens } from './tokens.js';
-import { embedText, cosineSimilarity } from './embeddings.js';
+import { embedText, cosineSimilarity, EMBEDDING_MODEL } from './embeddings.js';
 
 interface IndexSnapshot {
   version: 1;
+  embeddingModel: string;
   files: FileRecord[];
   chunks: CodeChunk[];
 }
@@ -150,23 +151,32 @@ export class IndexStore {
     };
   }
 
-  /** Writes the whole index to disk as JSON. */
-  save(snapshotPath: string): void {
+  /** Writes the whole index to disk as JSON, without blocking the event loop. */
+  async save(snapshotPath: string): Promise<void> {
     const snapshot: IndexSnapshot = {
       version: 1,
+      embeddingModel: EMBEDDING_MODEL,
       files: [...this.files.values()],
       chunks: [...this.chunks.values()],
     };
-    fs.mkdirSync(path.dirname(snapshotPath), { recursive: true });
-    fs.writeFileSync(snapshotPath, JSON.stringify(snapshot), 'utf-8');
+    await fs.promises.mkdir(path.dirname(snapshotPath), { recursive: true });
+    await fs.promises.writeFile(snapshotPath, JSON.stringify(snapshot), 'utf-8');
   }
 
-  /** Loads a previously saved snapshot, if present. Returns false if there was nothing to load. */
+  /**
+   * Loads a previously saved snapshot, if present. Returns false if there
+   * was nothing to load, OR if the snapshot was embedded with a different
+   * model than the one currently in use — mixing vectors from two models
+   * would make cosine similarity meaningless without ever erroring, so a
+   * mismatch is treated the same as "no snapshot" and triggers a fresh
+   * re-index instead of silently corrupting search quality.
+   */
   load(snapshotPath: string): boolean {
     if (!fs.existsSync(snapshotPath)) return false;
     try {
       const snapshot: IndexSnapshot = JSON.parse(fs.readFileSync(snapshotPath, 'utf-8'));
       if (snapshot.version !== 1) return false;
+      if (snapshot.embeddingModel !== EMBEDDING_MODEL) return false;
       this.files.clear();
       this.chunks.clear();
       for (const file of snapshot.files) this.files.set(file.filePath, file);

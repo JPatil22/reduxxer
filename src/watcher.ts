@@ -5,7 +5,7 @@ import ignoreLib, { type Ignore } from 'ignore';
 import { IndexStore } from './store.js';
 import { parseFile } from './indexer.js';
 import { parsePythonFile } from './pythonIndexer.js';
-import { embedText } from './embeddings.js';
+import { embedTexts } from './embeddings.js';
 import { hashContent } from './hash.js';
 import { CodeChunk } from './types.js';
 
@@ -71,9 +71,12 @@ export async function indexFile(store: IndexStore, filePath: string): Promise<vo
     const hash = hashContent(content);
     if (store.getFileHash(filePath) === hash) return; // unchanged, skip
     const chunks = parseByExtension(filePath, content);
-    for (const chunk of chunks) {
-      chunk.embedding = await embedText(embeddingInput(chunk.symbolName, chunk.code));
-    }
+    // One batched model call for all of this file's chunks instead of one
+    // call per chunk — amortizes tokenization/model overhead.
+    const vectors = await embedTexts(chunks.map((c) => embeddingInput(c.symbolName, c.code)));
+    chunks.forEach((chunk, i) => {
+      chunk.embedding = vectors[i];
+    });
     store.upsertFile(filePath, hash, chunks, content);
   } catch {
     // unreadable/binary file, ignore

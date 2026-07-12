@@ -28,6 +28,19 @@ function loadOrCreateToken(): string {
   return token;
 }
 
+/** Batches rapid successive file-change events into one snapshot write
+ *  after a short quiet period, instead of a full snapshot rewrite (which
+ *  includes every file's full content) on every single save. */
+function debouncedSaver(store: InstanceType<typeof IndexStore>, delayMs = 2000) {
+  let timer: NodeJS.Timeout | null = null;
+  return () => {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => {
+      store.save(snapshotPath).catch((err) => console.error('Failed to save index snapshot:', err));
+    }, delayMs);
+  };
+}
+
 async function main() {
   const store = new IndexStore();
 
@@ -35,7 +48,7 @@ async function main() {
     const loaded = store.load(snapshotPath);
     console.error(loaded ? `Loaded snapshot from ${snapshotPath}, re-indexing changes ...` : `Indexing ${repoPath} ...`);
     await indexRepo(store, repoPath);
-    store.save(snapshotPath);
+    await store.save(snapshotPath);
     console.error(JSON.stringify(store.stats(), null, 2));
     return;
   }
@@ -44,11 +57,12 @@ async function main() {
     const loaded = store.load(snapshotPath);
     console.error(loaded ? `Loaded snapshot from ${snapshotPath}, re-indexing changes ...` : `Indexing ${repoPath} ...`);
     await indexRepo(store, repoPath);
-    store.save(snapshotPath);
+    await store.save(snapshotPath);
     console.error(JSON.stringify(store.stats(), null, 2));
     console.error('Watching for changes... (Ctrl+C to stop)');
+    const saveDebounced = debouncedSaver(store);
     watchRepo(store, repoPath, (event, filePath) => {
-      store.save(snapshotPath);
+      saveDebounced();
       console.error(`[${event}] re-indexed ${filePath} -> ${JSON.stringify(store.stats())}`);
     });
     return;
@@ -57,8 +71,8 @@ async function main() {
   if (command === 'mcp') {
     store.load(snapshotPath);
     await indexRepo(store, repoPath);
-    store.save(snapshotPath);
-    watchRepo(store, repoPath, () => store.save(snapshotPath));
+    await store.save(snapshotPath);
+    watchRepo(store, repoPath, debouncedSaver(store));
     if (useHttp) {
       await startHttpMcpServer(store, port, loadOrCreateToken());
     } else {
