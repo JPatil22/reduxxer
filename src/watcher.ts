@@ -16,8 +16,10 @@ const EXTENSIONS = new Set(['.ts', '.tsx', '.js', '.jsx', '.vue', '.svelte', '.p
 const TEST_FILE_PATTERN =
   /(\.(test|spec)\.[jt]sx?$)|([\\/](__tests__|test|tests)[\\/])|([\\/]test_[^\\/]+\.py$)|(_test\.py$)/;
 
-function parseByExtension(filePath: string, content: string): CodeChunk[] {
-  return filePath.endsWith('.py') ? parsePythonFile(filePath, content) : parseFile(filePath, content);
+function parseByExtension(filePath: string, content: string): Promise<CodeChunk[]> {
+  return filePath.endsWith('.py')
+    ? parsePythonFile(filePath, content)
+    : Promise.resolve(parseFile(filePath, content));
 }
 
 /** Sane baseline ignores, applied even if the repo has no .gitignore (or
@@ -70,7 +72,7 @@ export async function indexFile(store: IndexStore, filePath: string): Promise<vo
     const content = fs.readFileSync(filePath, 'utf-8');
     const hash = hashContent(content);
     if (store.getFileHash(filePath) === hash) return; // unchanged, skip
-    const chunks = parseByExtension(filePath, content);
+    const chunks = await parseByExtension(filePath, content);
     // One batched model call for all of this file's chunks instead of one
     // call per chunk — amortizes tokenization/model overhead.
     const vectors = await embedTexts(chunks.map((c) => embeddingInput(c.symbolName, c.code)));
