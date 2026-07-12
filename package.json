@@ -1,0 +1,26 @@
+{
+  "name": "context-daemon",
+  "version": "0.2.0",
+  "description": "A local daemon that incrementally indexes a JS/TS repo and serves targeted code context over MCP, instead of AI coding tools re-reading whole files/repo every time.",
+  "type": "module",
+  "bin": {
+    "context-daemon": "./dist/src/cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p .",
+    "index": "node dist/src/cli.js index",
+    "watch": "node dist/src/cli.js watch",
+    "mcp": "node dist/src/cli.js mcp",
+    "benchmark": "node dist/demo/benchmark.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.7.0",
+    "@xenova/transformers": "^2.17.2",
+    "chokidar": "^3.6.0",
+    "typescript": "^5.5.4",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.9"
+  }
+}
