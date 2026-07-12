@@ -40,19 +40,25 @@ export function createMcpServer(store: IndexStore) {
     },
     async ({ query, limit }: { query: string; limit?: number }) => {
       const results = await store.search(query, limit ?? 5);
-      const logEntry = store.trackSearch(query, results);
-      const topReferences = new Set(results[0]?.references ?? []);
+      if (results.length === 0) {
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: 'No matching context found. If you expected code here, read the relevant file directly.',
+            },
+          ],
+        };
+      }
+      // Render as a ghost-file view (imports + matched code + collapsed
+      // sibling signatures) so the caller has the structure to edit safely.
+      const ghost = store.buildContext(results);
+      const logEntry = store.trackSearch(query, results, ghost);
       const text =
-        results.length === 0
-          ? 'No matching context found.'
-          : results
-              .map((r) => {
-                const label = topReferences.has(r.id) ? `${r.kind}, referenced by ${results[0].symbolName}` : r.kind;
-                return `// ${r.filePath} :: ${r.symbolName} (${label}, lines ${r.startLine}-${r.endLine})\n${r.code}`;
-              })
-              .join('\n\n---\n\n') +
-            `\n\n---\n[context-daemon] ~${logEntry.savedTokens} tokens saved this call ` +
-            `(${logEntry.naiveTokens} naive -> ${logEntry.targetedTokens} targeted)`;
+        ghost +
+        `\n\n---\n[context-daemon] ~${logEntry.savedTokens} tokens saved this call ` +
+        `(${logEntry.naiveTokens} naive -> ${logEntry.targetedTokens} targeted). ` +
+        `Lines shown are real; "// name (kind, lines …): signature" entries are other symbols in the file, collapsed — request them by name if you need their bodies.`;
       return { content: [{ type: 'text' as const, text }] };
     }
   );

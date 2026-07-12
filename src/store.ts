@@ -199,6 +199,70 @@ export class IndexStore {
     return [...results, ...expanded];
   }
 
+  private static readonly MAX_COLLAPSED_PER_FILE = 40;
+
+  /**
+   * Renders search results as a "ghost file" per source file rather than
+   * floating, context-free chunks: the file's imports/top-level constants at
+   * the top, the full code of the matched symbols in place, and every other
+   * symbol in that file collapsed to a one-line signature with its line
+   * range. This gives an AI the structural coordinates it needs to edit
+   * safely — what's imported, what else lives in the file, and exact line
+   * numbers — without shipping whole files.
+   */
+  buildContext(results: CodeChunk[]): string {
+    if (results.length === 0) return '';
+
+    const relevantByFile = new Map<string, Set<string>>();
+    const fileOrder: string[] = [];
+    for (const r of results) {
+      if (!relevantByFile.has(r.filePath)) {
+        relevantByFile.set(r.filePath, new Set());
+        fileOrder.push(r.filePath);
+      }
+      relevantByFile.get(r.filePath)!.add(r.id);
+    }
+
+    const blocks: string[] = [];
+    for (const filePath of fileOrder) {
+      const relevant = relevantByFile.get(filePath)!;
+      const record = this.files.get(filePath);
+      const fileChunks = (record?.chunkIds ?? [...relevant])
+        .map((id) => this.chunks.get(id))
+        .filter((c): c is CodeChunk => c !== undefined)
+        .sort((a, b) => a.startLine - b.startLine || a.endLine - b.endLine);
+
+      const out: string[] = [`// ═══ ${filePath} ═══`];
+      const header = fileChunks.find((c) => c.kind === 'module');
+      if (header) out.push(header.code);
+
+      let collapsedShown = 0;
+      let collapsedTotal = 0;
+      for (const chunk of fileChunks) {
+        if (chunk.kind === 'module') continue;
+        if (chunk.symbolName === '__file__') {
+          if (relevant.has(chunk.id)) out.push(chunk.code);
+          continue;
+        }
+        if (relevant.has(chunk.id)) {
+          out.push(`// ▸ ${chunk.symbolName}  (${chunk.kind}, lines ${chunk.startLine}-${chunk.endLine})`);
+          out.push(chunk.code);
+        } else {
+          collapsedTotal++;
+          if (collapsedShown >= IndexStore.MAX_COLLAPSED_PER_FILE) continue;
+          const signature = chunk.code.split('\n')[0].trim();
+          out.push(`//   ${chunk.symbolName}  (${chunk.kind}, lines ${chunk.startLine}-${chunk.endLine}):  ${signature}`);
+          collapsedShown++;
+        }
+      }
+      if (collapsedTotal > collapsedShown) {
+        out.push(`//   … ${collapsedTotal - collapsedShown} more symbol(s) in this file`);
+      }
+      blocks.push(out.join('\n'));
+    }
+    return blocks.join('\n\n');
+  }
+
   stats() {
     return {
       files: this.files.size,
@@ -212,13 +276,15 @@ export class IndexStore {
    * baseline of reading the whole file for every file the results came
    * from (i.e. what an AI tool would've paid without targeted search).
    */
-  trackSearch(query: string, results: CodeChunk[]): SearchLogEntry {
+  trackSearch(query: string, results: CodeChunk[], targetedText?: string): SearchLogEntry {
     const touchedFiles = new Set(results.map((r) => r.filePath));
     const naiveTokens = [...touchedFiles].reduce((sum, filePath) => {
       const content = this.files.get(filePath)?.content ?? '';
       return sum + estimateTokens(content);
     }, 0);
-    const targetedTokens = estimateTokens(results.map((r) => r.code).join('\n\n'));
+    // Measure the actual rendered output when provided (the ghost-file view),
+    // so the reported savings reflect what was really sent, not just raw chunks.
+    const targetedTokens = estimateTokens(targetedText ?? results.map((r) => r.code).join('\n\n'));
 
     const entry: SearchLogEntry = {
       query,

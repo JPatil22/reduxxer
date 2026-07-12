@@ -20,6 +20,44 @@ function chunk(overrides: Partial<CodeChunk>): CodeChunk {
   };
 }
 
+test('buildContext renders a ghost file: imports + matched code + collapsed siblings', () => {
+  const store = new IndexStore();
+  const mod = chunk({
+    filePath: 'auth.ts',
+    symbolName: '__module__',
+    kind: 'module',
+    id: 'auth.ts::__module__',
+    code: "import bcrypt from 'bcrypt';",
+    startLine: 1,
+    endLine: 1,
+  });
+  const login = chunk({
+    filePath: 'auth.ts',
+    symbolName: 'login',
+    id: 'auth.ts::login',
+    code: 'export function login(u: string) {\n  return hashPassword(u);\n}',
+    startLine: 5,
+    endLine: 7,
+  });
+  const hashPassword = chunk({
+    filePath: 'auth.ts',
+    symbolName: 'hashPassword',
+    id: 'auth.ts::hashPassword',
+    code: 'function hashPassword(pw: string): string {\n  return bcrypt.hashSync(pw);\n}',
+    startLine: 9,
+    endLine: 11,
+  });
+  store.upsertFile('auth.ts', 'h', [mod, login, hashPassword], 'file');
+
+  const ghost = store.buildContext([login]); // only login is "relevant"
+
+  assert.match(ghost, /import bcrypt/, 'imports (module header) are shown');
+  assert.match(ghost, /return hashPassword\(u\)/, 'the matched function body is shown in full');
+  // the non-relevant sibling appears as a one-line collapsed signature, not its body
+  assert.match(ghost, /hashPassword.*lines 9-11.*function hashPassword/);
+  assert.doesNotMatch(ghost, /bcrypt\.hashSync/, "the sibling's body is collapsed away");
+});
+
 test('upsertFile then removeFile leaves the store empty', () => {
   const store = new IndexStore();
   store.upsertFile('a.ts', 'hash1', [chunk({})], 'function foo() {}');

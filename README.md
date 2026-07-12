@@ -180,6 +180,16 @@ incidental word and scores low, so it returns *nothing* rather than
 confidently handing back the nearest wrong chunk — and the caller can then
 fall back to reading a file.
 
+Results aren't returned as floating, context-free snippets. `search_context`
+renders a **ghost file** per source file: the file's imports and top-level
+constants at the top, the full code of the matched symbols in place, and
+every *other* symbol in that file collapsed to a one-line signature with its
+line range. This gives an AI the structural coordinates it needs to edit
+safely — what's imported, what else lives in the file, and exact line
+numbers — without shipping whole files. Collapsed entries are clearly marked
+comments, so real source is never confused with omitted bodies; the caller
+can request a collapsed symbol by name if it needs the body.
+
 At index time, each chunk records which other symbols it calls — both
 same-file (e.g. `processPayment` calling `validateCard`) and, for JS/TS,
 symbols imported from another file (`import { validateUser } from './auth'`).
