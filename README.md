@@ -1,30 +1,47 @@
 # context-daemon
 
-A local daemon that incrementally indexes a repo (JS/TS — including React,
-Vue, and Svelte components — plus Python) at the function/class level and
-serves **targeted** code context over MCP — instead of AI coding tools
-(Claude Code, Cursor, Cline) re-reading whole files or the whole repo on
-every request.
+**Stop your AI coding tool from burning tokens re-reading your whole codebase.**
 
-## Why
+Claude Code, Cursor, and Cline pull large chunks of your repo into context on
+almost every message — often the same files, over and over. That's a big part
+of why people hit their token/quota limits so fast.
 
-Every message to an AI coding tool re-sends a lot of context, and people are
-hitting token/quota limits fast because of it. Token-reduction tools already
-exist (repomix, various MCP servers), but they mostly do a one-shot index —
-not a live index shared across multiple tools working the same repo at once.
+context-daemon runs quietly in the background, keeps a live index of your repo
+at the **function/class level**, and — when your AI tool asks — hands back just
+the few functions relevant to the task instead of whole files. Your tool gets
+what it needs; you stop paying for the rest.
 
-context-daemon proves three things:
+### What makes it different
 
-1. You can maintain a **live, incrementally-updated** index (only the
-   changed file gets re-parsed, not the whole repo) using a file watcher
-   and content hashing, persisted to disk so restarts are cheap.
-2. Serving **targeted, semantically-relevant chunks** (matched
-   functions/classes) instead of full files or a full repo dump
-   meaningfully cuts token usage — 70%+ in testing, more on larger repos.
-3. **One daemon process can serve multiple MCP clients at once** (e.g.
-   Claude Code and Cursor pointed at the same repo), sharing one index
-   instead of each tool spawning its own and duplicating the work — see
-   [Claude Code issue #28860](https://github.com/anthropics/claude-code/issues/28860).
+- **Targeted, not bulk.** Returns the handful of relevant functions, not entire
+  files or a full-repo dump. Meaningfully fewer tokens per request.
+- **Live, not one-shot.** A file watcher re-indexes only what you change, so the
+  index stays current without re-scanning the whole repo. Saved to disk, so
+  restarts are instant.
+- **Shared, not duplicated.** One daemon can serve several tools at once (e.g.
+  Claude Code *and* Cursor on the same repo) from one shared index, instead of
+  each tool re-indexing separately — an
+  [open gap in the tools themselves](https://github.com/anthropics/claude-code/issues/28860).
+- **Understands dependencies.** When it returns a function, it also pulls in the
+  functions that one calls — so the AI isn't handed code with the important
+  pieces missing.
+- **Local and private.** Your code never leaves your machine. Works fully
+  offline after a one-time model download.
+
+Works with **JavaScript, TypeScript, React, Vue, Svelte, and Python**.
+
+### Quick start
+
+```bash
+git clone https://github.com/JPatil22/reduxxer
+cd reduxxer/context-daemon
+npm install && npm run build
+
+# index your project and serve it to your AI tool over MCP
+node dist/src/cli.js mcp /path/to/your/project
+```
+
+Then point your AI coding tool at it (see [Run it as an MCP server](#run-it-as-an-mcp-server) below).
 
 ## What's inside
 
