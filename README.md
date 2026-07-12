@@ -50,6 +50,7 @@ context-daemon/
 cd context-daemon
 npm install
 npm run build
+npm test
 ```
 
 ## Try the benchmark first
