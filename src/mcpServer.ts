@@ -21,14 +21,15 @@ export function createMcpServer(store: IndexStore) {
     async ({ query, limit }: { query: string; limit?: number }) => {
       const results = await store.search(query, limit ?? 5);
       const logEntry = store.trackSearch(query, results);
+      const topReferences = new Set(results[0]?.references ?? []);
       const text =
         results.length === 0
           ? 'No matching context found.'
           : results
-              .map(
-                (r) =>
-                  `// ${r.filePath} :: ${r.symbolName} (${r.kind}, lines ${r.startLine}-${r.endLine})\n${r.code}`
-              )
+              .map((r) => {
+                const label = topReferences.has(r.id) ? `${r.kind}, referenced by ${results[0].symbolName}` : r.kind;
+                return `// ${r.filePath} :: ${r.symbolName} (${label}, lines ${r.startLine}-${r.endLine})\n${r.code}`;
+              })
               .join('\n\n---\n\n') +
             `\n\n---\n[context-daemon] ~${logEntry.savedTokens} tokens saved this call ` +
             `(${logEntry.naiveTokens} naive -> ${logEntry.targetedTokens} targeted)`;

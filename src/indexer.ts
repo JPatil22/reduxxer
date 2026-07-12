@@ -53,6 +53,9 @@ export function parseFile(filePath: string, content: string): CodeChunk[] {
 
   const chunks: CodeChunk[] = [];
   const lines = codeToParse.split('\n');
+  // Names this chunk calls (e.g. `validateCard(...)`), resolved against
+  // other chunks in this same file once every chunk has been collected.
+  const calledNamesByChunkId = new Map<string, Set<string>>();
 
   function getLineRange(node: ts.Node): { start: number; end: number } {
     const start = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile)).line + 1 + lineOffset;
@@ -60,13 +63,29 @@ export function parseFile(filePath: string, content: string): CodeChunk[] {
     return { start, end };
   }
 
+  /** Collects identifiers used as call/constructor targets within a node,
+   *  e.g. `validateCard(x)` or `new Logger()` both contribute a name. */
+  function collectCalledNames(node: ts.Node): Set<string> {
+    const names = new Set<string>();
+    function walk(n: ts.Node) {
+      if ((ts.isCallExpression(n) || ts.isNewExpression(n)) && ts.isIdentifier(n.expression)) {
+        names.add(n.expression.text);
+      }
+      ts.forEachChild(n, walk);
+    }
+    walk(node);
+    return names;
+  }
+
   function addChunk(name: string, kind: string, node: ts.Node) {
     const { start, end } = getLineRange(node);
     // start/end are absolute file line numbers (offset applied); `lines` is
     // relative to the parsed block, so slice using the un-offset range.
     const code = lines.slice(start - 1 - lineOffset, end - lineOffset).join('\n');
+    const id = `${filePath}::${name}`;
+    calledNamesByChunkId.set(id, collectCalledNames(node));
     chunks.push({
-      id: `${filePath}::${name}`,
+      id,
       filePath,
       symbolName: name,
       kind,
@@ -99,6 +118,18 @@ export function parseFile(filePath: string, content: string): CodeChunk[] {
   }
 
   visit(sourceFile);
+
+  // Resolve called names to chunk ids now that every same-file symbol is
+  // known. Self-references (recursion) are dropped — not useful context.
+  const nameToId = new Map(chunks.map((c) => [c.symbolName, c.id]));
+  for (const chunk of chunks) {
+    const calledNames = calledNamesByChunkId.get(chunk.id);
+    if (!calledNames) continue;
+    const references = [...calledNames]
+      .map((n) => nameToId.get(n))
+      .filter((id): id is string => id !== undefined && id !== chunk.id);
+    if (references.length > 0) chunk.references = references;
+  }
 
   if (chunks.length === 0 && codeToParse.trim().length > 0) {
     chunks.push({

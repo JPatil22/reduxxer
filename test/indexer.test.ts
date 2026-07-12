@@ -92,3 +92,30 @@ test('parseFile returns no chunks for a Vue SFC with no <script> block', () => {
   const chunks = parseFile('TemplateOnly.vue', '<template>\n  <div>static</div>\n</template>\n');
   assert.equal(chunks.length, 0);
 });
+
+test('parseFile records same-file call references between chunks', () => {
+  const chunks = parseFile(
+    'a.ts',
+    [
+      'function validateCard(card) { return true; }',
+      'function processPayment(order) {',
+      '  validateCard(order.card);',
+      '  return true;',
+      '}',
+    ].join('\n')
+  );
+  const processPayment = chunks.find((c) => c.symbolName === 'processPayment')!;
+  assert.deepEqual(processPayment.references, ['a.ts::validateCard']);
+  const validateCard = chunks.find((c) => c.symbolName === 'validateCard')!;
+  assert.equal(validateCard.references, undefined);
+});
+
+test('parseFile does not record a call to an unrelated/unknown function as a reference', () => {
+  const chunks = parseFile('a.ts', 'function foo() { console.log("hi"); }\n');
+  assert.equal(chunks[0].references, undefined);
+});
+
+test('parseFile does not record recursive self-calls as a reference', () => {
+  const chunks = parseFile('a.ts', 'function factorial(n) { return n <= 1 ? 1 : n * factorial(n - 1); }\n');
+  assert.equal(chunks[0].references, undefined);
+});

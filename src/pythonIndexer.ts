@@ -33,6 +33,7 @@ interface PythonChunk {
   kind: string;
   start: number;
   end: number;
+  references: string[];
 }
 
 /**
@@ -73,6 +74,7 @@ export function parsePythonFile(filePath: string, content: string): CodeChunk[] 
     endLine: c.end,
     code: lines.slice(c.start - 1, c.end).join('\n'),
     fileHash,
+    references: c.references?.length ? c.references.map((name) => `${filePath}::${name}`) : undefined,
   }));
 
   if (chunks.length === 0 && content.trim().length > 0) {

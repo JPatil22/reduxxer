@@ -76,6 +76,12 @@ export class IndexStore {
    * has one) with the lexical score as a boost — lexical alone misses
    * synonyms/paraphrases ("ship an order" vs "notifyOrderShipped"), and
    * semantic alone can miss exact identifier matches, so combine both.
+   *
+   * Also does a one-hop dependency expansion on the top match: a chunk
+   * like processPayment returned in isolation is missing the context of
+   * what validateCard/updateLedger (the functions it calls) actually do.
+   * Those get appended after the ranked matches, up to a small cap, so
+   * results stay grounded in what the query actually matched.
    */
   async search(query: string, limit = 5): Promise<CodeChunk[]> {
     const chunks = this.allChunks();
@@ -92,11 +98,34 @@ export class IndexStore {
       return { chunk, score, matched: semantic > 0 || lexical > 0 };
     });
 
-    return scored
+    const results = scored
       .filter((s) => s.matched)
       .sort((a, b) => b.score - a.score)
       .slice(0, limit)
       .map((s) => s.chunk);
+
+    return this.expandWithReferences(results);
+  }
+
+  /** Appends the top result's direct same-file dependencies (if not
+   *  already present), capped so expansion can't dwarf the real matches. */
+  private expandWithReferences(results: CodeChunk[]): CodeChunk[] {
+    const MAX_EXPANDED = 3;
+    const top = results[0];
+    if (!top?.references?.length) return results;
+
+    const alreadyIncluded = new Set(results.map((r) => r.id));
+    const expanded: CodeChunk[] = [];
+    for (const refId of top.references) {
+      if (expanded.length >= MAX_EXPANDED) break;
+      if (alreadyIncluded.has(refId)) continue;
+      const refChunk = this.chunks.get(refId);
+      if (refChunk) {
+        expanded.push(refChunk);
+        alreadyIncluded.add(refId);
+      }
+    }
+    return [...results, ...expanded];
   }
 
   stats() {

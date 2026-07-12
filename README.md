@@ -133,6 +133,14 @@ identifier searches work well. Whole-file fallback chunks (files with no
 top-level function/class match) and test files are de-prioritized/excluded
 so they don't drown out real symbol matches.
 
+At index time, each chunk also records which other same-file top-level
+symbols it calls (e.g. `processPayment` calling `validateCard`). The top
+search match gets expanded with its direct dependencies (up to 3, labeled
+`referenced by <match>` in the output) instead of being returned in
+isolation — so asking about a function that mostly delegates to helpers
+gets you those helpers too, not just the entry point. This is same-file
+only (no cross-file import resolution) and one hop deep.
+
 ## Known limitations
 
 - Supported languages: JS/TS-family (`.js`/`.ts`/`.jsx`/`.tsx`, plus the
@@ -152,10 +160,9 @@ so they don't drown out real symbol matches.
 - Search is brute-force cosine similarity over every embedded chunk — fine
   at the thousands-of-chunks scale this has been tested at, not verified
   at tens-of-thousands-of-chunks monorepo scale.
-- No dependency/call-graph awareness — search_context returns the best-
-  matching chunk(s) in isolation, with no expansion to functions they call.
-  A query about a function that delegates most of its logic to helpers
-  will get that function but not its dependencies.
+- Dependency expansion is same-file and one-hop only — it won't follow a
+  call into a function imported from another file, and won't chase a
+  dependency's own dependencies.
 - The HTTP transport is localhost-only with a per-repo bearer token, not
   meant to be exposed beyond the machine it runs on.
 - Token-savings tracking is session-scoped (not persisted to the snapshot).
@@ -163,7 +170,5 @@ so they don't drown out real symbol matches.
 ## Suggested next steps
 
 - Persist the token-savings log alongside the index snapshot.
-- One-hop dependency expansion: record which local symbols each chunk
-  references at index time, and pull in direct references alongside the
-  top search match instead of returning it in isolation.
+- Cross-file dependency expansion (resolve imports, not just same-file calls).
 - Package for `npx context-daemon` / global install instead of clone + build.

@@ -47,3 +47,16 @@ test('parsePythonFile returns no chunks for an empty file', () => {
   const chunks = parsePythonFile('a.py', '');
   assert.equal(chunks.length, 0);
 });
+
+test('parsePythonFile records same-file call references between chunks', () => {
+  const chunks = parsePythonFile(
+    'a.py',
+    ['def validate_card(card):', '    return True', '', '', 'def process_payment(order):', '    validate_card(order)', '    return True'].join(
+      '\n'
+    )
+  );
+  const processPayment = chunks.find((c) => c.symbolName === 'process_payment')!;
+  assert.deepEqual(processPayment.references, ['a.py::validate_card']);
+  const validateCard = chunks.find((c) => c.symbolName === 'validate_card')!;
+  assert.equal(validateCard.references, undefined);
+});

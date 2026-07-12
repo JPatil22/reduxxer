@@ -93,6 +93,45 @@ test('whole-file fallback chunks are ranked below a real symbol match on the sam
   assert.equal(results[0].symbolName, 'parseOrder');
 });
 
+test('search expands the top match with its direct same-file dependencies', async () => {
+  const store = new IndexStore();
+  store.upsertFile(
+    'a.ts',
+    'hash1',
+    [
+      chunk({
+        symbolName: 'processPayment',
+        code: 'function processPayment(order) { validateCard(order); }',
+        id: 'a.ts::processPayment',
+        references: ['a.ts::validateCard'],
+      }),
+      chunk({
+        symbolName: 'validateCard',
+        code: 'function validateCard(order) { return true; }',
+        id: 'a.ts::validateCard',
+      }),
+      chunk({
+        symbolName: 'unrelatedHelper',
+        code: 'function unrelatedHelper() { return 1; }',
+        id: 'a.ts::unrelatedHelper',
+      }),
+    ],
+    ''
+  );
+  const results = await store.search('process a payment', 1);
+  const symbolNames = results.map((r) => r.symbolName);
+  assert.ok(symbolNames.includes('processPayment'));
+  assert.ok(symbolNames.includes('validateCard'), 'expanded dependency should be included');
+  assert.ok(!symbolNames.includes('unrelatedHelper'), 'non-referenced chunk should not be pulled in');
+});
+
+test('search does not expand when the top match has no references', async () => {
+  const store = new IndexStore();
+  store.upsertFile('a.ts', 'hash1', [chunk({ symbolName: 'standalone', code: 'function standalone() {}' })], '');
+  const results = await store.search('standalone', 1);
+  assert.equal(results.length, 1);
+});
+
 test('trackSearch computes naive vs targeted token counts and cumulative savings', () => {
   const store = new IndexStore();
   store.upsertFile('a.ts', 'hash1', [chunk({ code: 'short' })], 'a much longer full file content here');

@@ -9,6 +9,11 @@ export interface CodeChunk {
   fileHash: string;
   /** Normalized embedding vector for semantic search, if computed. */
   embedding?: number[];
+  /** Chunk ids of other same-file symbols this chunk calls, e.g.
+   *  processPayment calling validateCard records validateCard's chunk id.
+   *  Used to expand a search result with its direct dependencies instead
+   *  of returning it in isolation. Same-file only — no import resolution. */
+  references?: string[];
 }
 
 export interface FileRecord {
