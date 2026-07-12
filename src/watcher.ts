@@ -7,7 +7,7 @@ import { IndexStore } from './store.js';
 import { parseFile } from './indexer.js';
 import { embedText } from './embeddings.js';
 
-const EXTENSIONS = new Set(['.ts', '.tsx', '.js', '.jsx']);
+const EXTENSIONS = new Set(['.ts', '.tsx', '.js', '.jsx', '.vue', '.svelte']);
 
 /** Test files add noise to search results (huge files, no real symbols to
  *  target) without being what someone means by "give me the relevant code". */

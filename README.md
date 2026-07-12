@@ -1,9 +1,10 @@
 # context-daemon
 
-A local daemon that incrementally indexes a JS/TS repo at the function/class
-level and serves **targeted** code context over MCP — instead of AI coding
-tools (Claude Code, Cursor, Cline) re-reading whole files or the whole repo
-on every request.
+A local daemon that incrementally indexes a JS/TS repo (including React,
+Vue, and Svelte components) at the function/class level and serves
+**targeted** code context over MCP — instead of AI coding tools (Claude
+Code, Cursor, Cline) re-reading whole files or the whole repo on every
+request.
 
 ## Why
 
@@ -129,12 +130,14 @@ so they don't drown out real symbol matches.
 
 ## Known limitations
 
-- JS/TS only (TypeScript compiler API, not tree-sitter — no native
-  bindings to install, but no Python/Go/Rust support yet).
+- JS/TS-family languages only, via the TypeScript compiler API: plain
+  `.js`/`.ts`/`.jsx`/`.tsx`, and the `<script>` block of Vue (`.vue`) and
+  Svelte (`.svelte`) single-file components. No Python/Go/Rust support yet.
 - Embedding every chunk at index time is CPU-bound and not fast — expect
   tens of milliseconds per chunk on first index of a large repo. Persistence
   means this cost is only paid once per file, not on every restart.
-- No auth on the HTTP transport — it's meant for localhost use.
+- The HTTP transport is localhost-only with a per-repo bearer token, not
+  meant to be exposed beyond the machine it runs on.
 - Token-savings tracking is session-scoped (not persisted to the snapshot).
 
 ## Suggested next steps

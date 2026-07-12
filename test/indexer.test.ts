@@ -59,3 +59,36 @@ test('parseFile chunk ids are unique and derived from filePath + symbolName', ()
   assert.equal(chunks[0].id, 'src/a.ts::foo');
   assert.equal(chunks[1].id, 'src/a.ts::bar');
 });
+
+test('parseFile extracts functions from a Vue SFC <script> block', () => {
+  const sfc = [
+    '<template>',
+    '  <div>{{ label }}</div>',
+    '</template>',
+    '<script lang="ts">',
+    'export function formatLabel(name: string) {',
+    '  return name.toUpperCase();',
+    '}',
+    '</script>',
+  ].join('\n');
+  const chunks = parseFile('Widget.vue', sfc);
+  assert.equal(chunks.length, 1);
+  assert.equal(chunks[0].symbolName, 'formatLabel');
+  // line 5 in the SFC (1-indexed) is where the function starts
+  assert.equal(chunks[0].startLine, 5);
+});
+
+test('parseFile extracts functions from a Svelte <script> block', () => {
+  const sfc = ['<script>', 'export function double(n) {', '  return n * 2;', '}', '</script>', '<p>hi</p>'].join(
+    '\n'
+  );
+  const chunks = parseFile('Counter.svelte', sfc);
+  assert.equal(chunks.length, 1);
+  assert.equal(chunks[0].symbolName, 'double');
+  assert.equal(chunks[0].startLine, 2);
+});
+
+test('parseFile returns no chunks for a Vue SFC with no <script> block', () => {
+  const chunks = parseFile('TemplateOnly.vue', '<template>\n  <div>static</div>\n</template>\n');
+  assert.equal(chunks.length, 0);
+});
