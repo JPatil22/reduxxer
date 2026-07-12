@@ -142,7 +142,13 @@ export function parseFile(filePath: string, content: string): CodeChunk[] {
     const signature = `${mods ? mods + ' ' : ''}class ${className}${typeParams}${heritage ? ' ' + heritage : ''} {`;
     const headerCode = [signature, ...fields.map((f) => '  ' + f.getText(sourceFile)), '}'].join('\n');
 
-    const { start, end } = getLineRange(node);
+    // The header's line range must cover only what its code actually shows —
+    // the declaration line through the last field — not the whole class span,
+    // or an AI editing by these coordinates would target the wrong lines.
+    const classStart = getLineRange(node).start;
+    const headerEnd = fields.length
+      ? Math.max(classStart, ...fields.map((f) => getLineRange(f).end))
+      : classStart;
     const headerId = `${filePath}::${className}`;
     calledNamesByChunkId.set(headerId, new Set());
     chunks.push({
@@ -150,8 +156,8 @@ export function parseFile(filePath: string, content: string): CodeChunk[] {
       filePath,
       symbolName: className,
       kind: 'class',
-      startLine: start,
-      endLine: end,
+      startLine: classStart,
+      endLine: headerEnd,
       code: headerCode,
       fileHash,
     });

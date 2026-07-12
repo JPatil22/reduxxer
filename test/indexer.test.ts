@@ -20,6 +20,11 @@ test('parseFile splits a class into a header chunk plus one chunk per method', (
 
   const methods = chunks.filter((c) => c.kind === 'method').map((c) => c.symbolName);
   assert.deepEqual(methods, ['Widget.render', 'Widget.reset']);
+
+  // The header's line range covers the declaration + fields, not the whole
+  // class — its endLine must not run into the method bodies below.
+  assert.equal(header!.startLine, 1);
+  assert.equal(header!.endLine, 2); // the `count = 0` field on line 2, not the class's closing brace
 });
 
 test('parseFile extracts an interface declaration as a chunk', () => {

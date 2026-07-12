@@ -4,15 +4,39 @@ import { CodeChunk, FileRecord, SearchLogEntry } from './types.js';
 import { estimateTokens } from './tokens.js';
 import { embedText, cosineSimilarity, EMBEDDING_MODEL } from './embeddings.js';
 
+// On disk, a chunk's embedding is a base64 Float32 string (`emb`) rather than
+// a JSON array of ~384 full-precision numbers — roughly 3x smaller on disk.
+type SerializedChunk = Omit<CodeChunk, 'embedding'> & { emb?: string };
+
 interface IndexSnapshot {
   version: 1;
   embeddingModel: string;
   lastUpdatedAt?: string;
   files: FileRecord[];
-  chunks: CodeChunk[];
+  chunks: SerializedChunk[];
 }
 
 const SEARCH_LOG_LIMIT = 200;
+
+function encodeEmbedding(vec: number[]): string {
+  return Buffer.from(Float32Array.from(vec).buffer).toString('base64');
+}
+
+function decodeEmbedding(b64: string): number[] {
+  const buf = Buffer.from(b64, 'base64');
+  // Account for byteOffset — Node Buffers can be views into a shared pool.
+  return Array.from(new Float32Array(buf.buffer, buf.byteOffset, Math.floor(buf.byteLength / 4)));
+}
+
+function serializeChunk(chunk: CodeChunk): SerializedChunk {
+  const { embedding, ...rest } = chunk;
+  return embedding ? { ...rest, emb: encodeEmbedding(embedding) } : rest;
+}
+
+function deserializeChunk(chunk: SerializedChunk): CodeChunk {
+  const { emb, ...rest } = chunk;
+  return emb ? { ...rest, embedding: decodeEmbedding(emb) } : rest;
+}
 
 /**
  * In-memory index. Holds the "cheat sheet" of the repo: one chunk per
@@ -332,7 +356,7 @@ export class IndexStore {
       embeddingModel: EMBEDDING_MODEL,
       lastUpdatedAt: this.lastUpdatedAt,
       files: [...this.files.values()],
-      chunks: [...this.chunks.values()],
+      chunks: [...this.chunks.values()].map(serializeChunk),
     };
     await fs.promises.mkdir(path.dirname(snapshotPath), { recursive: true });
     await fs.promises.writeFile(snapshotPath, JSON.stringify(snapshot), 'utf-8');
@@ -355,7 +379,10 @@ export class IndexStore {
       this.files.clear();
       this.chunks.clear();
       for (const file of snapshot.files) this.files.set(file.filePath, file);
-      for (const chunk of snapshot.chunks) this.chunks.set(chunk.id, chunk);
+      for (const chunk of snapshot.chunks) {
+        const c = deserializeChunk(chunk);
+        this.chunks.set(c.id, c);
+      }
       if (snapshot.lastUpdatedAt) this.lastUpdatedAt = snapshot.lastUpdatedAt;
       return true;
     } catch {

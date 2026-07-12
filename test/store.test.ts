@@ -255,6 +255,27 @@ test('save/load round-trips the index to disk', async () => {
   assert.equal(loaded.getFileHash('a.ts'), 'hash1');
 });
 
+test('save/load round-trips an embedding through the base64 Float32 format', async () => {
+  const store = new IndexStore();
+  const embedding = [0.1, -0.25, 0.5, 0.75, -1, 0]; // Float32-representable values
+  store.upsertFile('a.ts', 'h', [chunk({ embedding })], 'x');
+
+  const tmpFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'store-emb-')), 'index.json');
+  await store.save(tmpFile);
+  // Snapshot must not contain a raw JSON number array for the embedding.
+  const raw = fs.readFileSync(tmpFile, 'utf-8');
+  assert.doesNotMatch(raw, /"embedding":\s*\[/);
+  assert.match(raw, /"emb":/);
+
+  const loaded = new IndexStore();
+  loaded.load(tmpFile);
+  const back = loaded.allChunks()[0].embedding!;
+  assert.equal(back.length, embedding.length);
+  for (let i = 0; i < embedding.length; i++) {
+    assert.ok(Math.abs(back[i] - embedding[i]) < 1e-6, `component ${i} preserved`);
+  }
+});
+
 test('load refuses a snapshot written by a different embedding model', async () => {
   const store = new IndexStore();
   store.upsertFile('a.ts', 'hash1', [chunk({})], 'function foo() {}');
