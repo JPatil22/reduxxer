@@ -9,13 +9,33 @@ import { IndexStore } from './store.js';
  * instead of the tool reading whole files into its own context.
  */
 export function createMcpServer(store: IndexStore) {
-  const server = new McpServer({ name: 'context-daemon', version: '0.2.0' });
+  const server = new McpServer(
+    { name: 'context-daemon', version: '0.2.0' },
+    {
+      instructions:
+        'This server serves targeted code context for the current repository. When you need to ' +
+        'find or understand code in this repo, prefer calling search_context first (describe what ' +
+        'you want in plain language) instead of reading whole files — it returns just the relevant ' +
+        'functions/classes and their dependencies, keeping context small and token usage low. ' +
+        'Read full files only when you genuinely need the entire file or when search_context ' +
+        'returns nothing useful.',
+    }
+  );
 
   server.tool(
     'search_context',
-    'Search the live codebase index for the most relevant functions/classes for a task. Returns compact code chunks, not whole files.',
+    'PREFERRED way to pull code from this repository into context. Before reading whole files ' +
+      'to find or understand code here, call this first: describe what you are looking for in ' +
+      'plain language and it returns the specific functions/classes that matter (plus the ones ' +
+      'they depend on) as compact chunks, instead of you reading entire files. This keeps ' +
+      'context small and token cost low. Good for "where/how is X handled", "find the code that ' +
+      'does Y", or gathering the relevant pieces before an edit. Fall back to reading a full ' +
+      'file only when you need the complete file (imports, top-level wiring) or a search turns ' +
+      'up nothing.',
     {
-      query: z.string().describe('What you are trying to do or find, e.g. "handle user login"'),
+      query: z
+        .string()
+        .describe('Plain-language description of the code you need, e.g. "handle user login" or "where orders get cancelled"'),
       limit: z.number().optional().describe('Max chunks to return, default 5'),
     },
     async ({ query, limit }: { query: string; limit?: number }) => {
