@@ -101,11 +101,12 @@ embedding model (~90MB, one time, fully offline afterward).
 
 ## Run it as an MCP server
 
-**Single client (stdio)** — one process per client, standard MCP pattern:
+### Recommended: zero-touch setup (stdio)
 
-```bash
-node dist/src/cli.js mcp /path/to/a/real/repo
-```
+This is the setup most people want. **Your AI tool starts and stops the
+daemon for you** — you never launch anything manually, and there's nothing
+to keep running in the background. Add this to your tool's MCP config
+(e.g. `.mcp.json` for Claude Code, or the equivalent in Cursor):
 
 ```json
 {
@@ -118,8 +119,23 @@ node dist/src/cli.js mcp /path/to/a/real/repo
 }
 ```
 
-**Multiple clients sharing one daemon (HTTP)** — start it once, point as
-many MCP clients at it as you want:
+That's the whole setup. From then on:
+
+- Your AI tool launches the daemon automatically each session — **no manual
+  start, no restarts.**
+- The daemon loads its saved index instantly and watches your repo, so as
+  you edit files it keeps itself current in the background.
+- When the AI needs context, it calls the daemon and gets back just the
+  relevant functions. You never think about it.
+
+(You'll restart your editor **once** after first adding the config, so it
+picks up the new MCP server. After that, it's automatic.)
+
+### Advanced: share one daemon across multiple tools (HTTP)
+
+Only needed if you want, say, Claude Code *and* Cursor hitting **one** shared
+index at the same time. Here you start the daemon yourself and leave it
+running:
 
 ```bash
 node dist/src/cli.js mcp /path/to/a/real/repo --http --port=7621
