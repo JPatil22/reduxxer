@@ -131,6 +131,29 @@ That's the whole setup. From then on:
 (You'll restart your editor **once** after first adding the config, so it
 picks up the new MCP server. After that, it's automatic.)
 
+### Getting your AI tool to actually prefer the daemon
+
+MCP tools are *advisory* — the model decides each turn whether to call
+`search_context` or just read files itself. The daemon's tool description and
+server instructions already steer it toward searching first, but the
+strongest lever is a **standing instruction in your project**, which the
+assistant reads as a direct rule for that repo. Drop this into your project's
+`CLAUDE.md` (Claude Code) or `.cursorrules` (Cursor):
+
+```md
+## Finding code in this repo
+
+Always use the `search_context` tool FIRST when you need to find or
+understand code here — describe what you want in plain language. It returns
+the relevant functions (and their dependencies) as a compact ghost-file view.
+Only read a whole file when search_context returns nothing, or when you
+genuinely need the entire file (e.g. full top-level wiring).
+```
+
+This won't *force* it (nothing can, with MCP), but it's the most reliable way
+to make the assistant reach for the daemon by default instead of reading
+files.
+
 ### Advanced: share one daemon across multiple tools (HTTP)
 
 Only needed if you want, say, Claude Code *and* Cursor hitting **one** shared
