@@ -96,11 +96,75 @@ export function parseFile(filePath: string, content: string): CodeChunk[] {
     });
   }
 
+  function isFunctionLikeProperty(m: ts.ClassElement): boolean {
+    return (
+      ts.isPropertyDeclaration(m) &&
+      m.initializer !== undefined &&
+      (ts.isArrowFunction(m.initializer) || ts.isFunctionExpression(m.initializer))
+    );
+  }
+
+  function memberName(m: ts.ClassElement): string {
+    if (ts.isConstructorDeclaration(m)) return 'constructor';
+    return m.name ? m.name.getText(sourceFile) : 'anonymous';
+  }
+
+  /**
+   * A whole class indexed as one chunk is nearly the whole file — it matches
+   * almost any query about the class, crowds out the specific method that
+   * actually answers, and barely saves tokens. So split it: one compact
+   * "header" chunk (class signature + field declarations, no method bodies)
+   * that keeps the class's shape findable, plus one chunk per method.
+   */
+  function addClassChunks(node: ts.ClassDeclaration, className: string) {
+    const methods: ts.ClassElement[] = [];
+    const fields: ts.PropertyDeclaration[] = [];
+    for (const member of node.members) {
+      if (
+        ts.isMethodDeclaration(member) ||
+        ts.isConstructorDeclaration(member) ||
+        ts.isGetAccessorDeclaration(member) ||
+        ts.isSetAccessorDeclaration(member) ||
+        isFunctionLikeProperty(member)
+      ) {
+        methods.push(member);
+      } else if (ts.isPropertyDeclaration(member)) {
+        fields.push(member);
+      }
+    }
+
+    const mods = node.modifiers?.map((m) => m.getText(sourceFile)).join(' ') ?? '';
+    const typeParams = node.typeParameters
+      ? `<${node.typeParameters.map((t) => t.getText(sourceFile)).join(', ')}>`
+      : '';
+    const heritage = node.heritageClauses?.map((h) => h.getText(sourceFile)).join(' ') ?? '';
+    const signature = `${mods ? mods + ' ' : ''}class ${className}${typeParams}${heritage ? ' ' + heritage : ''} {`;
+    const headerCode = [signature, ...fields.map((f) => '  ' + f.getText(sourceFile)), '}'].join('\n');
+
+    const { start, end } = getLineRange(node);
+    const headerId = `${filePath}::${className}`;
+    calledNamesByChunkId.set(headerId, new Set());
+    chunks.push({
+      id: headerId,
+      filePath,
+      symbolName: className,
+      kind: 'class',
+      startLine: start,
+      endLine: end,
+      code: headerCode,
+      fileHash,
+    });
+
+    for (const member of methods) {
+      addChunk(`${className}.${memberName(member)}`, 'method', member);
+    }
+  }
+
   function visit(node: ts.Node) {
     if (ts.isFunctionDeclaration(node) && node.name) {
       addChunk(node.name.text, 'function', node);
     } else if (ts.isClassDeclaration(node) && node.name) {
-      addChunk(node.name.text, 'class', node);
+      addClassChunks(node, node.name.text);
     } else if (ts.isInterfaceDeclaration(node)) {
       addChunk(node.name.text, 'interface', node);
     } else if (ts.isVariableStatement(node)) {

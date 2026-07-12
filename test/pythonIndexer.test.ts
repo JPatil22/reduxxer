@@ -9,12 +9,20 @@ test('parsePythonFile extracts a top-level function', () => {
   assert.equal(chunks[0].kind, 'function');
 });
 
-test('parsePythonFile extracts a class (with its methods included in the chunk)', () => {
-  const chunks = parsePythonFile('a.py', 'class Widget:\n    def render(self):\n        pass\n');
-  assert.equal(chunks.length, 1);
-  assert.equal(chunks[0].symbolName, 'Widget');
-  assert.equal(chunks[0].kind, 'class');
-  assert.match(chunks[0].code, /def render/);
+test('parsePythonFile splits a class into a header chunk plus one chunk per method', () => {
+  const chunks = parsePythonFile(
+    'a.py',
+    'class Widget:\n    rate = 5\n\n    def render(self):\n        pass\n\n    async def refresh(self):\n        pass\n'
+  );
+
+  const header = chunks.find((c) => c.kind === 'class');
+  assert.equal(header?.symbolName, 'Widget');
+  assert.match(header!.code, /rate = 5/);
+  assert.doesNotMatch(header!.code, /def render/);
+
+  const methods = chunks.filter((c) => c.kind.endsWith('method')).map((c) => c.symbolName);
+  assert.deepEqual(methods, ['Widget.render', 'Widget.refresh']);
+  assert.equal(chunks.find((c) => c.symbolName === 'Widget.refresh')?.kind, 'async-method');
 });
 
 test('parsePythonFile distinguishes async functions', () => {

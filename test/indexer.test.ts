@@ -9,11 +9,17 @@ test('parseFile extracts a function declaration as a chunk', () => {
   assert.equal(chunks[0].kind, 'function');
 });
 
-test('parseFile extracts a class declaration as a chunk', () => {
-  const chunks = parseFile('a.ts', 'export class Widget {\n  render() {}\n}\n');
-  assert.equal(chunks.length, 1);
-  assert.equal(chunks[0].symbolName, 'Widget');
-  assert.equal(chunks[0].kind, 'class');
+test('parseFile splits a class into a header chunk plus one chunk per method', () => {
+  const chunks = parseFile('a.ts', 'export class Widget {\n  count = 0;\n  render() { return this.count; }\n  reset() { this.count = 0; }\n}\n');
+
+  const header = chunks.find((c) => c.kind === 'class');
+  assert.equal(header?.symbolName, 'Widget');
+  // Header keeps the class shape (fields) but not method bodies.
+  assert.match(header!.code, /count = 0/);
+  assert.doesNotMatch(header!.code, /return this\.count/);
+
+  const methods = chunks.filter((c) => c.kind === 'method').map((c) => c.symbolName);
+  assert.deepEqual(methods, ['Widget.render', 'Widget.reset']);
 });
 
 test('parseFile extracts an interface declaration as a chunk', () => {
