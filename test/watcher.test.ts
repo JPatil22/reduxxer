@@ -65,6 +65,22 @@ test('indexRepo picks up a Python file via the same walk as JS/TS', async () => 
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
+test('indexing the same repo via relative and absolute paths does not duplicate chunks', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'context-daemon-pathnorm-'));
+  fs.writeFileSync(path.join(tmpDir, 'a.ts'), 'export function alpha() { return 1; }');
+
+  const store = new IndexStore();
+  await indexRepo(store, tmpDir); // absolute
+  const afterAbsolute = store.stats().chunks;
+
+  // Index the very same repo again via a non-canonical spelling (trailing
+  // "/." ). Without path normalization this stored every file a second time.
+  await indexRepo(store, path.join(tmpDir, '.'));
+  assert.equal(store.stats().chunks, afterAbsolute);
+
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
 test('re-indexing an unchanged repo skips re-parsing (hash-based skip)', async () => {
   const store = new IndexStore();
   await indexRepo(store, fixtureRepo);

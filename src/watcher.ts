@@ -91,6 +91,11 @@ export async function indexRepo(store: IndexStore, rootDir: string): Promise<voi
     throw new Error(`Repo path is not a directory: ${rootDir}`);
   }
 
+  // Normalize to an absolute path so a file is always stored under one
+  // canonical path spelling — otherwise indexing the same repo once as "."
+  // and once as its absolute path stores every file twice (duplicate chunks,
+  // wasted tokens in search results).
+  rootDir = path.resolve(rootDir);
   const ig = loadIgnore(rootDir);
 
   async function walk(dir: string) {
@@ -114,6 +119,10 @@ export function watchRepo(
   rootDir: string,
   onChange?: (event: string, filePath: string) => void
 ) {
+  // Same canonicalization as indexRepo — chokidar reports absolute paths,
+  // so the watcher and the initial walk must agree on path spelling or
+  // change events would key differently than the indexed entries.
+  rootDir = path.resolve(rootDir);
   const ig = loadIgnore(rootDir);
   const watcher = chokidar.watch(rootDir, {
     ignored: (filePath: string) => isIgnored(ig, rootDir, filePath),

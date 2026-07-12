@@ -8,7 +8,9 @@ import { startMcpServer } from './mcpServer.js';
 import { startHttpMcpServer } from './httpServer.js';
 
 const [, , command, ...rest] = process.argv;
-const repoPath = rest.find((a) => !a.startsWith('--')) ?? process.cwd();
+// Resolve to absolute so the snapshot location and the indexed file paths
+// are canonical no matter whether the repo was passed as "." or a full path.
+const repoPath = path.resolve(rest.find((a) => !a.startsWith('--')) ?? process.cwd());
 const daemonDir = path.join(repoPath, '.context-daemon');
 const snapshotPath = path.join(daemonDir, 'index.json');
 const tokenPath = path.join(daemonDir, 'http-token');
