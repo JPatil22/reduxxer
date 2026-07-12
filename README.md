@@ -173,8 +173,8 @@ The top search match gets expanded with its direct dependencies instead of
 being returned in isolation — so asking about a function that delegates to
 helpers, including helpers in *other* files, gets you those too, not just
 the entry point. Expansion is one hop deep and capped so it can't dwarf the
-real matches. Cross-file resolution currently covers JS/TS relative imports;
-Python expansion is same-file only for now.
+real matches. Cross-file resolution covers JS/TS relative imports and Python
+`from ... import` statements.
 
 ## Known limitations
 
@@ -196,8 +196,9 @@ Python expansion is same-file only for now.
   at the thousands-of-chunks scale this has been tested at, not verified
   at tens-of-thousands-of-chunks monorepo scale.
 - Dependency expansion is one-hop only (it won't chase a dependency's own
-  dependencies). Cross-file import resolution works for JS/TS relative
-  imports; Python expansion is still same-file only.
+  dependencies). Cross-file resolution follows JS/TS relative imports and
+  Python `from ... import` statements; it does not resolve `import x`
+  followed by `x.y()` attribute calls, or non-relative package imports.
 - The HTTP transport is localhost-only with a per-repo bearer token, not
   meant to be exposed beyond the machine it runs on.
 - Token-savings tracking is session-scoped (not persisted to the snapshot).
@@ -205,5 +206,4 @@ Python expansion is same-file only for now.
 ## Suggested next steps
 
 - Persist the token-savings log alongside the index snapshot.
-- Cross-file dependency expansion for Python (JS/TS is done).
 - Package for `npx context-daemon` / global install instead of clone + build.

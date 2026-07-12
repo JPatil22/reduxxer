@@ -28,12 +28,34 @@ function resolveInterpreter(): string | null {
   return null;
 }
 
+interface PythonExternal {
+  name: string;
+  level: number; // 0 = absolute import, 1 = `.`, 2 = `..`, ...
+  module: string | null;
+}
+
 interface PythonChunk {
   name: string;
   kind: string;
   start: number;
   end: number;
   references: string[];
+  external?: PythonExternal[];
+}
+
+/**
+ * Resolves a Python `from ... import name` to "<path-without-ext>::<name>"
+ * (the store tries .py / package __init__.py against it). Relative imports
+ * (level >= 1) resolve precisely from the file's directory; absolute
+ * imports (level 0) are a best-effort guess relative to the same directory,
+ * which simply finds nothing (harmless) if the guess is wrong.
+ */
+function resolvePythonImport(filePath: string, ext: PythonExternal): string {
+  let baseDir = path.dirname(filePath);
+  for (let i = 0; i < ext.level - 1; i++) baseDir = path.dirname(baseDir);
+  const moduleParts = ext.module ? ext.module.split('.') : [];
+  const prefix = path.join(baseDir, ...moduleParts);
+  return `${prefix}::${ext.name}`;
 }
 
 /**
@@ -75,6 +97,9 @@ export function parsePythonFile(filePath: string, content: string): CodeChunk[] 
     code: lines.slice(c.start - 1, c.end).join('\n'),
     fileHash,
     references: c.references?.length ? c.references.map((name) => `${filePath}::${name}`) : undefined,
+    externalRefs: c.external?.length
+      ? c.external.map((ext) => resolvePythonImport(filePath, ext))
+      : undefined,
   }));
 
   if (chunks.length === 0 && content.trim().length > 0) {

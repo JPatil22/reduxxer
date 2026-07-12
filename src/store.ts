@@ -107,11 +107,15 @@ export class IndexStore {
     return this.expandWithReferences(results);
   }
 
-  private static readonly RESOLVE_EXTS = ['.ts', '.tsx', '.js', '.jsx', '.vue', '.svelte'];
+  private static readonly RESOLVE_EXTS = ['.ts', '.tsx', '.js', '.jsx', '.vue', '.svelte', '.py'];
+  // Directory-as-module entry points: JS/TS resolve `./dir` to dir/index.*,
+  // Python resolves a package to dir/__init__.py.
+  private static readonly INDEX_FILES = ['index.ts', 'index.tsx', 'index.js', 'index.jsx', '__init__.py'];
 
   /** Resolves a cross-file ref ("<path-without-ext>::<name>") to an actual
-   *  indexed chunk by trying each extension and an /index file, since the
-   *  exact extension isn't known when imports are recorded at parse time. */
+   *  indexed chunk by trying each file extension and directory entry point,
+   *  since the exact extension isn't known when imports are recorded at
+   *  parse time. */
   private resolveExternalRef(ref: string): CodeChunk | undefined {
     const sep = ref.lastIndexOf('::');
     if (sep < 0) return undefined;
@@ -121,8 +125,8 @@ export class IndexStore {
       const direct = this.chunks.get(`${prefix}${ext}::${name}`);
       if (direct) return direct;
     }
-    for (const ext of IndexStore.RESOLVE_EXTS) {
-      const idx = this.chunks.get(`${path.join(prefix, 'index' + ext)}::${name}`);
+    for (const indexFile of IndexStore.INDEX_FILES) {
+      const idx = this.chunks.get(`${path.join(prefix, indexFile)}::${name}`);
       if (idx) return idx;
     }
     return undefined;

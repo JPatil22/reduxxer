@@ -34,7 +34,46 @@ def node_start(node: ast.AST) -> int:
     return node.lineno
 
 
-def emit_class(node: ast.ClassDef, top_level_names: set) -> list:
+def collect_imports(tree: ast.Module) -> dict:
+    """Maps each name bound by a `from X import Y` to how to reach it:
+    {local_name: {"level": int, "module": str|None, "original": str}}.
+    (Path resolution happens on the Node side, which knows the file path.)
+    Only `from ... import name` forms are tracked — `import x` then `x.y()`
+    is an attribute call, which we don't resolve."""
+    imports = {}
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name == "*":
+                    continue
+                local = alias.asname or alias.name
+                imports[local] = {
+                    "level": node.level,
+                    "module": node.module,
+                    "original": alias.name,
+                }
+    return imports
+
+
+def deps_for(node: ast.AST, self_name: str, top_level_names: set, imports: dict) -> tuple:
+    """Splits a node's calls into same-file references (bare top-level names)
+    and external references (imported symbols, with resolution info for the
+    Node side to turn into file paths)."""
+    called = called_names(node)
+    references = sorted(called & top_level_names - {self_name})
+    external = []
+    for nm in sorted(called):
+        if nm in top_level_names:
+            continue
+        info = imports.get(nm)
+        if info:
+            external.append(
+                {"name": info["original"], "level": info["level"], "module": info["module"]}
+            )
+    return references, external
+
+
+def emit_class(node: ast.ClassDef, top_level_names: set, imports: dict) -> list:
     """A class header chunk (signature + class-level attributes) plus one
     chunk per method."""
     methods = [b for b in node.body if isinstance(b, (ast.FunctionDef, ast.AsyncFunctionDef))]
@@ -46,11 +85,12 @@ def emit_class(node: ast.ClassDef, top_level_names: set) -> list:
             "start": node.lineno,
             "end": max(header_end, node.lineno),
             "references": [],
+            "external": [],
         }
     ]
     for m in methods:
         kind = "async-method" if isinstance(m, ast.AsyncFunctionDef) else "method"
-        references = sorted(called_names(m) & top_level_names - {node.name})
+        references, external = deps_for(m, node.name, top_level_names, imports)
         chunks.append(
             {
                 "name": f"{node.name}.{m.name}",
@@ -58,6 +98,7 @@ def emit_class(node: ast.ClassDef, top_level_names: set) -> list:
                 "start": node_start(m),
                 "end": m.end_lineno,
                 "references": references,
+                "external": external,
             }
         )
     return chunks
@@ -71,6 +112,7 @@ def main() -> None:
         print(json.dumps({"error": str(e)}))
         return
 
+    imports = collect_imports(tree)
     defs = [
         node
         for node in tree.body
@@ -81,10 +123,10 @@ def main() -> None:
     chunks = []
     for node in defs:
         if isinstance(node, ast.ClassDef):
-            chunks.extend(emit_class(node, top_level_names))
+            chunks.extend(emit_class(node, top_level_names, imports))
         else:
             kind = "async-function" if isinstance(node, ast.AsyncFunctionDef) else "function"
-            references = sorted(called_names(node) & top_level_names - {node.name})
+            references, external = deps_for(node, node.name, top_level_names, imports)
             chunks.append(
                 {
                     "name": node.name,
@@ -92,6 +134,7 @@ def main() -> None:
                     "start": node_start(node),
                     "end": node.end_lineno,
                     "references": references,
+                    "external": external,
                 }
             )
 

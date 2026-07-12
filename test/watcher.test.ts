@@ -106,6 +106,28 @@ test('search pulls in a dependency imported from another file (cross-file expans
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
+test('search pulls in a Python dependency imported from another file', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'context-daemon-pyxfile-'));
+  fs.writeFileSync(path.join(tmpDir, 'auth.py'), 'def validate_user(uid):\n    return len(uid) > 0\n');
+  fs.writeFileSync(
+    path.join(tmpDir, 'orders.py'),
+    'from .auth import validate_user\n\n\ndef process_order(uid):\n    if not validate_user(uid):\n        raise ValueError("bad")\n'
+  );
+
+  const store = new IndexStore();
+  await indexRepo(store, tmpDir);
+
+  const results = await store.search('process an order for a user', 1);
+  const names = results.map((r) => r.symbolName);
+  assert.ok(names.includes('process_order'), 'the matched function should be returned');
+  assert.ok(
+    names.includes('validate_user'),
+    'the Python function imported from another file should be pulled in too'
+  );
+
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
 test('re-indexing an unchanged repo skips re-parsing (hash-based skip)', async () => {
   const store = new IndexStore();
   await indexRepo(store, fixtureRepo);
