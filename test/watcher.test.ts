@@ -133,6 +133,22 @@ test('search pulls in a Python dependency imported from another file', async () 
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
+test('indexRepo skips files over the size limit, without reading their content', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'context-daemon-filesize-'));
+  fs.writeFileSync(path.join(tmpDir, 'normal.ts'), 'export function normal() { return 1; }');
+  // Just over the 1MB limit.
+  fs.writeFileSync(path.join(tmpDir, 'huge.ts'), 'export function huge() {}\n// ' + 'x'.repeat(1024 * 1024 + 100));
+
+  const store = new IndexStore();
+  await indexRepo(store, tmpDir);
+
+  assert.equal(store.stats().files, 1, 'only the normal-size file was indexed');
+  assert.equal(store.allChunks()[0].symbolName, 'normal');
+  assert.equal(store.getFileHash(path.join(tmpDir, 'huge.ts')), undefined, 'the huge file was never read/hashed');
+
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
 test('re-indexing an unchanged repo skips re-parsing (hash-based skip)', async () => {
   const store = new IndexStore();
   await indexRepo(store, fixtureRepo);

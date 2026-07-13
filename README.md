@@ -241,6 +241,10 @@ real matches. Cross-file resolution covers JS/TS relative imports and Python
   `.py` files are silently skipped (with a one-time warning) if neither
   is found. Only top-level functions/classes are extracted, same
   granularity as the JS/TS side (a class chunk includes its methods).
+- Files over 1MB are skipped entirely (logged, not silent) — minified
+  bundles and large generated files can stall the parser/embedding step
+  for little benefit. Genuine hand-written source is essentially never
+  this large.
 - Embedding every chunk at index time is CPU-bound and not fast — expect
   tens of milliseconds per chunk on first index of a large repo, sequentially
   (batching many chunks into one model call was tried and measured slower

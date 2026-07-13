@@ -67,13 +67,25 @@ function embeddingInput(symbolName: string, code: string): string {
   return `${symbolName}\n${code.slice(0, 1000)}`;
 }
 
-/** Re-index a single file, but skip it if content hash hasn't changed. */
 const indexLimit = pLimit(8);
+
+// Files past this size are skipped entirely (not even read) — minified
+// bundles and large generated files can stall the TS compiler or Python's
+// ast module and produce a giant, low-value embedding call. Genuine
+// hand-written source is essentially never this large.
+const MAX_FILE_SIZE_BYTES = 1024 * 1024; // 1MB
 
 /** Re-index a single file, but skip it if content hash hasn't changed. */
 export async function indexFile(store: IndexStore, filePath: string, repoRoot?: string): Promise<void> {
   return indexLimit(async () => {
     try {
+      const stat = fs.statSync(filePath);
+      if (stat.size > MAX_FILE_SIZE_BYTES) {
+        console.error(
+          `context-daemon: skipped ${filePath} — ${Math.round(stat.size / 1024)}KB exceeds the ${MAX_FILE_SIZE_BYTES / 1024}KB indexing limit (likely generated/minified)`
+        );
+        return;
+      }
       const content = fs.readFileSync(filePath, 'utf-8');
       const hash = hashContent(content);
       if (store.getFileHash(filePath) === hash) return; // unchanged, skip
