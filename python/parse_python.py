@@ -104,13 +104,11 @@ def emit_class(node: ast.ClassDef, top_level_names: set, imports: dict) -> list:
     return chunks
 
 
-def main() -> None:
-    source = sys.stdin.read()
+def parse_source(source: str) -> dict:
     try:
         tree = ast.parse(source)
     except SyntaxError as e:
-        print(json.dumps({"error": str(e)}))
-        return
+        return {"error": str(e)}
 
     imports = collect_imports(tree)
     defs = [
@@ -161,9 +159,33 @@ def main() -> None:
                     "external": external,
                 }
             )
+    return {"chunks": chunks}
 
-    print(json.dumps({"chunks": chunks}))
+
+def main() -> None:
+    if "--worker" in sys.argv:
+        while True:
+            line = sys.stdin.readline()
+            if not line:
+                break
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+                source = data["content"]
+                result = parse_source(source)
+                print(json.dumps(result))
+                sys.stdout.flush()
+            except Exception as e:
+                print(json.dumps({"error": str(e)}))
+                sys.stdout.flush()
+    else:
+        source = sys.stdin.read()
+        result = parse_source(source)
+        print(json.dumps(result))
 
 
 if __name__ == "__main__":
     main()
+

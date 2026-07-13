@@ -1,9 +1,14 @@
-import { test } from 'node:test';
+import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
+import { closePythonWorker } from '../src/pythonIndexer.js';
+
+after(() => {
+  closePythonWorker();
+});
 import { IndexStore } from '../src/store.js';
 import { indexRepo } from '../src/watcher.js';
 

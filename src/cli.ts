@@ -7,6 +7,7 @@ import { indexRepo, watchRepo } from './watcher.js';
 import { startMcpServer } from './mcpServer.js';
 import { startHttpMcpServer } from './httpServer.js';
 import { disableEmbeddings } from './embeddings.js';
+import { closePythonWorker } from './pythonIndexer.js';
 
 const [, , command, ...rest] = process.argv;
 if (rest.includes('--no-embeddings')) {
@@ -70,6 +71,7 @@ async function main() {
     await indexRepo(store, repoPath);
     await store.save(snapshotPath);
     console.error(JSON.stringify(store.stats(), null, 2));
+    closePythonWorker();
     return;
   }
 

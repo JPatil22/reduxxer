@@ -1,6 +1,8 @@
-import { spawn } from 'node:child_process';
+import { spawn, ChildProcess } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import fs from 'node:fs';
+import readline from 'node:readline';
 import { CodeChunk } from './types.js';
 import { hashContent } from './hash.js';
 
@@ -49,6 +51,94 @@ function resolveInterpreter(): Promise<string | null> {
   return interpreterPromise;
 }
 
+class PythonWorker {
+  private proc: ChildProcess | null = null;
+  private queue: Array<{ resolve: (val: any) => void; reject: (err: any) => void }> = [];
+  private startPromise: Promise<boolean> | null = null;
+
+  async start(): Promise<boolean> {
+    if (this.startPromise) return this.startPromise;
+    this.startPromise = (async () => {
+      const interp = await resolveInterpreter();
+      if (!interp) return false;
+      
+      try {
+        this.proc = spawn(interp, ['-u', PARSE_SCRIPT, '--worker']);
+        this.proc.on('error', (err) => {
+          this.handleCrash(err);
+        });
+        this.proc.on('exit', (code) => {
+          this.handleCrash(new Error(`Python process exited with code ${code}`));
+        });
+        
+        // Suppress stderr noise but allow printing errors
+        this.proc.stderr!.on('data', (d) => {
+          console.error(`context-daemon: python worker stderr: ${d.toString().trim()}`);
+        });
+
+        const rl = readline.createInterface({
+          input: this.proc.stdout!,
+          terminal: false
+        });
+        
+        rl.on('line', (line) => {
+          const next = this.queue.shift();
+          if (!next) return;
+          try {
+            const parsed = JSON.parse(line);
+            next.resolve(parsed);
+          } catch (e) {
+            next.reject(e);
+          }
+        });
+        
+        return true;
+      } catch (err) {
+        console.error('context-daemon: failed to start Python worker:', err);
+        return false;
+      }
+    })();
+    return this.startPromise;
+  }
+
+  private handleCrash(err: Error) {
+    const oldQueue = this.queue;
+    this.queue = [];
+    for (const item of oldQueue) {
+      item.reject(err);
+    }
+    this.proc = null;
+    this.startPromise = null;
+  }
+
+  close() {
+    if (this.proc) {
+      this.proc.kill();
+      this.proc = null;
+    }
+    this.startPromise = null;
+    this.queue = [];
+  }
+
+  async parse(content: string): Promise<any> {
+    const active = await this.start();
+    if (!active || !this.proc) {
+      throw new Error('Python worker not active');
+    }
+    
+    return new Promise((resolve, reject) => {
+      this.queue.push({ resolve, reject });
+      this.proc!.stdin!.write(JSON.stringify({ content }) + '\n');
+    });
+  }
+}
+
+const worker = new PythonWorker();
+
+export function closePythonWorker() {
+  worker.close();
+}
+
 interface PythonExternal {
   name: string;
   level: number; // 0 = absolute import, 1 = `.`, 2 = `..`, ...
@@ -64,16 +154,35 @@ interface PythonChunk {
   external?: PythonExternal[];
 }
 
+function findRepoRoot(filePath: string): string {
+  let current = path.dirname(path.resolve(filePath));
+  while (true) {
+    const daemonDir = path.join(current, '.context-daemon');
+    if (fs.existsSync(daemonDir)) {
+      return current;
+    }
+    const parent = path.dirname(current);
+    if (parent === current) {
+      return process.cwd();
+    }
+    current = parent;
+  }
+}
+
 /**
  * Resolves a Python `from ... import name` to "<path-without-ext>::<name>"
  * (the store tries .py / package __init__.py against it). Relative imports
  * (level >= 1) resolve precisely from the file's directory; absolute
- * imports (level 0) are a best-effort guess relative to the same directory,
- * which simply finds nothing (harmless) if the guess is wrong.
+ * imports (level 0) resolve relative to the repo root.
  */
-function resolvePythonImport(filePath: string, ext: PythonExternal): string {
-  let baseDir = path.dirname(filePath);
-  for (let i = 0; i < ext.level - 1; i++) baseDir = path.dirname(baseDir);
+function resolvePythonImport(filePath: string, ext: PythonExternal, repoRoot?: string): string {
+  let baseDir: string;
+  if (ext.level === 0) {
+    baseDir = repoRoot ? path.resolve(repoRoot) : findRepoRoot(filePath);
+  } else {
+    baseDir = path.dirname(filePath);
+    for (let i = 0; i < ext.level - 1; i++) baseDir = path.dirname(baseDir);
+  }
   const moduleParts = ext.module ? ext.module.split('.') : [];
   const prefix = path.join(baseDir, ...moduleParts);
   return `${prefix}::${ext.name}`;
@@ -85,35 +194,22 @@ function resolvePythonImport(filePath: string, ext: PythonExternal): string {
  * subprocess — real parsing, not regex, but out-of-process since there's
  * no equivalent to the TypeScript compiler API for Python in Node.
  *
- * Async (non-blocking): the earlier spawnSync froze the whole event loop
- * for every .py file, which stalled the MCP server and any client during
- * indexing of a Python repo. This streams via spawn instead.
+ * This version uses a persistent Python worker process to handle AST requests,
+ * eliminating the subprocess spawning overhead entirely.
  */
-export async function parsePythonFile(filePath: string, content: string): Promise<CodeChunk[]> {
-  const interpreter = await resolveInterpreter();
-  if (!interpreter) return [];
-
-  let stdout: string;
+export async function parsePythonFile(filePath: string, content: string, repoRoot?: string): Promise<CodeChunk[]> {
+  let result: any;
   try {
-    const result = await run(interpreter, [PARSE_SCRIPT], content);
-    if (result.code !== 0 || !result.stdout) return [];
-    stdout = result.stdout;
-  } catch {
-    return []; // interpreter vanished, etc.
-  }
-
-  let parsed: { chunks?: PythonChunk[]; error?: string };
-  try {
-    parsed = JSON.parse(stdout);
+    result = await worker.parse(content);
+    if (!result || result.error || !result.chunks) return [];
   } catch {
     return [];
   }
-  if (parsed.error || !parsed.chunks) return []; // syntax error in the target file, skip it
 
   const fileHash = hashContent(content);
   const lines = content.split('\n');
 
-  const chunks: CodeChunk[] = parsed.chunks.map((c) => ({
+  const chunks: CodeChunk[] = result.chunks.map((c: PythonChunk) => ({
     id: `${filePath}::${c.name}`,
     filePath,
     symbolName: c.name,
@@ -124,7 +220,7 @@ export async function parsePythonFile(filePath: string, content: string): Promis
     fileHash,
     references: c.references?.length ? c.references.map((name) => `${filePath}::${name}`) : undefined,
     externalRefs: c.external?.length
-      ? c.external.map((ext) => resolvePythonImport(filePath, ext))
+      ? c.external.map((ext) => resolvePythonImport(filePath, ext, repoRoot))
       : undefined,
   }));
 
@@ -143,3 +239,4 @@ export async function parsePythonFile(filePath: string, content: string): Promis
 
   return chunks;
 }
+

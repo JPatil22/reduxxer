@@ -8,6 +8,7 @@ import { parsePythonFile } from './pythonIndexer.js';
 import { embedTexts } from './embeddings.js';
 import { hashContent } from './hash.js';
 import { CodeChunk } from './types.js';
+import { pLimit } from './utils.js';
 
 const EXTENSIONS = new Set(['.ts', '.tsx', '.js', '.jsx', '.vue', '.svelte', '.py']);
 
@@ -16,9 +17,9 @@ const EXTENSIONS = new Set(['.ts', '.tsx', '.js', '.jsx', '.vue', '.svelte', '.p
 const TEST_FILE_PATTERN =
   /(\.(test|spec)\.[jt]sx?$)|([\\/](__tests__|test|tests)[\\/])|([\\/]test_[^\\/]+\.py$)|(_test\.py$)/;
 
-function parseByExtension(filePath: string, content: string): Promise<CodeChunk[]> {
+function parseByExtension(filePath: string, content: string, repoRoot?: string): Promise<CodeChunk[]> {
   return filePath.endsWith('.py')
-    ? parsePythonFile(filePath, content)
+    ? parsePythonFile(filePath, content, repoRoot)
     : Promise.resolve(parseFile(filePath, content));
 }
 
@@ -67,28 +68,33 @@ function embeddingInput(symbolName: string, code: string): string {
 }
 
 /** Re-index a single file, but skip it if content hash hasn't changed. */
-export async function indexFile(store: IndexStore, filePath: string): Promise<void> {
-  try {
-    const content = fs.readFileSync(filePath, 'utf-8');
-    const hash = hashContent(content);
-    if (store.getFileHash(filePath) === hash) return; // unchanged, skip
-    const chunks = await parseByExtension(filePath, content);
-    // One batched model call for all of this file's chunks instead of one
-    // call per chunk — amortizes tokenization/model overhead.
-    const vectors = await embedTexts(chunks.map((c) => embeddingInput(c.symbolName, c.code)));
-    chunks.forEach((chunk, i) => {
-      chunk.embedding = vectors[i];
-    });
-    store.upsertFile(filePath, hash, chunks, content);
-  } catch (err) {
-    // A file vanishing between walk and read (ENOENT) is normal churn and
-    // stays quiet. Anything else — a parse crash, an embedding failure — is
-    // surfaced so a partially-indexed repo isn't a silent mystery.
-    const code = (err as NodeJS.ErrnoException)?.code;
-    if (code === 'ENOENT') return;
-    const message = err instanceof Error ? err.message : String(err);
-    console.error(`context-daemon: skipped ${filePath} — ${message}`);
-  }
+const indexLimit = pLimit(8);
+
+/** Re-index a single file, but skip it if content hash hasn't changed. */
+export async function indexFile(store: IndexStore, filePath: string, repoRoot?: string): Promise<void> {
+  return indexLimit(async () => {
+    try {
+      const content = fs.readFileSync(filePath, 'utf-8');
+      const hash = hashContent(content);
+      if (store.getFileHash(filePath) === hash) return; // unchanged, skip
+      const chunks = await parseByExtension(filePath, content, repoRoot);
+      // One batched model call for all of this file's chunks instead of one
+      // call per chunk — amortizes tokenization/model overhead.
+      const vectors = await embedTexts(chunks.map((c) => embeddingInput(c.symbolName, c.code)));
+      chunks.forEach((chunk, i) => {
+        chunk.embedding = vectors[i];
+      });
+      store.upsertFile(filePath, hash, chunks, content);
+    } catch (err) {
+      // A file vanishing between walk and read (ENOENT) is normal churn and
+      // stays quiet. Anything else — a parse crash, an embedding failure — is
+      // surfaced so a partially-indexed repo isn't a silent mystery.
+      const code = (err as NodeJS.ErrnoException)?.code;
+      if (code === 'ENOENT') return;
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`context-daemon: skipped ${filePath} — ${message}`);
+    }
+  });
 }
 
 export async function indexRepo(store: IndexStore, rootDir: string): Promise<void> {
@@ -106,6 +112,7 @@ export async function indexRepo(store: IndexStore, rootDir: string): Promise<voi
   rootDir = path.resolve(rootDir);
   const ig = loadIgnore(rootDir);
 
+  const tasks: Promise<void>[] = [];
   async function walk(dir: string) {
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
       if (entry.name.startsWith('.') && entry.name !== '.') continue;
@@ -114,11 +121,12 @@ export async function indexRepo(store: IndexStore, rootDir: string): Promise<voi
       if (entry.isDirectory()) {
         await walk(full);
       } else if (isIndexable(full)) {
-        await indexFile(store, full);
+        tasks.push(indexFile(store, full, rootDir));
       }
     }
   }
   await walk(rootDir);
+  await Promise.all(tasks);
 }
 
 /** Watches the repo and incrementally re-indexes only the file that changed. */
@@ -144,13 +152,13 @@ export function watchRepo(
 
   watcher.on('add', async (filePath) => {
     if (isIndexable(filePath)) {
-      await indexFile(store, filePath);
+      await indexFile(store, filePath, rootDir);
       onChange?.('add', filePath);
     }
   });
   watcher.on('change', async (filePath) => {
     if (isIndexable(filePath)) {
-      await indexFile(store, filePath);
+      await indexFile(store, filePath, rootDir);
       onChange?.('change', filePath);
     }
   });

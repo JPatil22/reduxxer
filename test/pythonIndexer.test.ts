@@ -1,6 +1,11 @@
-import { test } from 'node:test';
+import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { parsePythonFile } from '../src/pythonIndexer.js';
+import path from 'node:path';
+import { parsePythonFile, closePythonWorker } from '../src/pythonIndexer.js';
+
+after(() => {
+  closePythonWorker();
+});
 
 test('parsePythonFile extracts a top-level function', async () => {
   const chunks = await parsePythonFile('a.py', 'def greet(name):\n    return f"hi {name}"\n');
@@ -68,3 +73,15 @@ test('parsePythonFile records same-file call references between chunks', async (
   const validateCard = chunks.find((c) => c.symbolName === 'validate_card')!;
   assert.equal(validateCard.references, undefined);
 });
+
+test('parsePythonFile records absolute imports resolved relative to repo root', async () => {
+  const chunks = await parsePythonFile(
+    'a.py',
+    ['from my_app.models import User', '', 'def process_order():', '    User()'].join('\n'),
+    process.cwd()
+  );
+  const processOrder = chunks.find((c) => c.symbolName === 'process_order')!;
+  const expectedRoot = path.resolve(process.cwd());
+  assert.deepEqual(processOrder.externalRefs, [`${path.join(expectedRoot, 'my_app', 'models')}::User`]);
+});
+
