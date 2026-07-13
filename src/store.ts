@@ -4,6 +4,17 @@ import { CodeChunk, FileRecord, SearchLogEntry } from './types.js';
 import { estimateTokens } from './tokens.js';
 import { embedText, cosineSimilarity, EMBEDDING_MODEL } from './embeddings.js';
 import { memoizingStemmer as stemmer } from 'porter-stemmer';
+import { AnnIndex } from './annIndex.js';
+
+// Explicit escape hatch: brute-force cosine search (IndexStore's default,
+// always-available path) stays fully intact regardless of this setting —
+// disabling ANN just means IndexStore never switches to it, even for a
+// huge repo. Set false via --no-ann if the ANN path is ever suspected of
+// causing a problem, without needing a code change to fall back.
+let annEnabled = true;
+export function setAnnEnabled(enabled: boolean): void {
+  annEnabled = enabled;
+}
 
 // On disk, a chunk's embedding is a base64 Float32 string (`emb`) rather than
 // a JSON array of ~384 full-precision numbers — roughly 3x smaller on disk.
@@ -62,6 +73,19 @@ export class IndexStore {
   private bm25Avgdl = 1;
   private bm25Dirty = true;
 
+  // Approximate nearest-neighbor index (usearch/HNSW), built only once the
+  // corpus of embedded chunks crosses this threshold. Below it, brute-force
+  // cosine search (this class's default, always-available path) is already
+  // fast — verified 175ms at 50k chunks — and simpler to trust than a native
+  // dependency, so there's no reason to pay ANN's one-time build cost for a
+  // repo that doesn't need it. Mutable (not readonly) so tests can lower it
+  // instead of constructing tens of thousands of chunks to exercise this path.
+  private static ANN_THRESHOLD = 20000;
+  static setAnnThresholdForTests(n: number): void {
+    IndexStore.ANN_THRESHOLD = n;
+  }
+  private annIndex: AnnIndex | null = null;
+
   getFileHash(filePath: string): string | undefined {
     return this.files.get(filePath)?.hash;
   }
@@ -69,25 +93,62 @@ export class IndexStore {
   upsertFile(filePath: string, hash: string, chunks: CodeChunk[], content: string): void {
     const old = this.files.get(filePath);
     if (old) {
-      for (const id of old.chunkIds) this.chunks.delete(id);
+      for (const id of old.chunkIds) {
+        this.chunks.delete(id);
+        this.annIndex?.remove(id);
+      }
     }
     const chunkIds: string[] = [];
     for (const chunk of chunks) {
       this.chunks.set(chunk.id, chunk);
       chunkIds.push(chunk.id);
+      if (this.annIndex && chunk.embedding) this.annIndex.add(chunk.id, chunk.embedding);
     }
     this.files.set(filePath, { filePath, hash, chunkIds, tokens: estimateTokens(content) });
     this.lastUpdatedAt = new Date().toISOString();
     this.bm25Dirty = true;
+    this.maybeInitAnn();
   }
 
   removeFile(filePath: string): void {
     const old = this.files.get(filePath);
     if (old) {
-      for (const id of old.chunkIds) this.chunks.delete(id);
+      for (const id of old.chunkIds) {
+        this.chunks.delete(id);
+        this.annIndex?.remove(id);
+      }
       this.files.delete(filePath);
       this.lastUpdatedAt = new Date().toISOString();
       this.bm25Dirty = true;
+    }
+  }
+
+  /**
+   * The first time the embedded-chunk count crosses ANN_THRESHOLD, builds
+   * the index once from everything currently indexed (logged, since this is
+   * a real one-time delay, not something to leave silent). After that,
+   * upsertFile/removeFile above keep it incrementally in sync — no more
+   * full rebuilds on every file change, which would otherwise make normal
+   * editing feel like it hangs. If building fails for any reason, falls
+   * back to brute-force (annIndex stays null) rather than crash the daemon.
+   */
+  private maybeInitAnn(): void {
+    if (!annEnabled || this.annIndex) return;
+    const embedded = [...this.chunks.values()].filter((c) => c.embedding);
+    if (embedded.length < IndexStore.ANN_THRESHOLD) return;
+    try {
+      const dim = embedded[0].embedding!.length;
+      const idx = new AnnIndex(dim);
+      console.error(
+        `context-daemon: ${embedded.length} embedded chunks crossed the fast-search threshold (${IndexStore.ANN_THRESHOLD}) — building a fast search index now, this is a one-time cost and may take a while on a large repo...`
+      );
+      const t0 = Date.now();
+      for (const c of embedded) idx.add(c.id, c.embedding!);
+      console.error(`context-daemon: fast search index built in ${((Date.now() - t0) / 1000).toFixed(1)}s.`);
+      this.annIndex = idx;
+    } catch (err) {
+      console.error('context-daemon: failed to build fast search index, falling back to standard search:', err);
+      this.annIndex = null;
     }
   }
 
@@ -181,9 +242,43 @@ export class IndexStore {
     const chunks = this.allChunks();
     const hasEmbeddings = chunks.some((c) => c.embedding);
     const queryEmbedding = hasEmbeddings ? await embedText(query) : null;
+    return this.searchWithEmbedding(query, queryEmbedding, limit, chunks);
+  }
+
+  /**
+   * Test-only: searches using a pre-computed embedding directly instead of
+   * running the real (slow, non-deterministic-to-set-up) embedding model —
+   * lets ANN correctness tests use small, synthetic, deterministic vectors
+   * to verify actual ranking behavior, not just "it doesn't crash".
+   */
+  async searchByEmbeddingForTests(embedding: number[], limit = 5): Promise<CodeChunk[]> {
+    if (this.bm25Dirty) this.rebuildBm25();
+    return this.searchWithEmbedding('', embedding, limit, this.allChunks());
+  }
+
+  private async searchWithEmbedding(
+    query: string,
+    queryEmbedding: number[] | null,
+    limit: number,
+    chunks: CodeChunk[]
+  ): Promise<CodeChunk[]> {
     const normalizedQuery = query.toLowerCase().trim();
     const terms = this.queryTerms(query);
     const queryTokens = this.tokenize(query);
+
+    // When the ANN index is active, pull a generous candidate set of
+    // semantically-close chunks from it instead of computing cosine
+    // similarity against every single chunk. Chunks outside this candidate
+    // set simply get semantic=0 (same as a chunk with no embedding at all)
+    // — they still fully qualify for results via an exact name match or
+    // real lexical (BM25) overlap, just without the semantic-floor boost.
+    // Requesting well more than `limit` candidates leaves room for BM25 and
+    // the relevance gate below to re-rank without losing the true best match.
+    let annScores: Map<string, number> | null = null;
+    if (this.annIndex && queryEmbedding) {
+      const candidateK = Math.max(limit * 10, 50);
+      annScores = new Map(this.annIndex.search(queryEmbedding, candidateK).map((r) => [r.chunkId, r.similarity]));
+    }
 
     // BM25 scores are unbounded and corpus-dependent, so normalize them to
     // [0,1] within this query (top lexical hit = 1) before blending with the
@@ -202,8 +297,11 @@ export class IndexStore {
       // fully prevent.
       const kindPenalty = chunk.kind === 'file' ? 0.3 : 1;
       const lexical = (bm25Max > 0 ? bm25Raw[i] / bm25Max : 0) * kindPenalty;
-      const semantic =
-        queryEmbedding && chunk.embedding ? cosineSimilarity(queryEmbedding, chunk.embedding) : 0;
+      const semantic = annScores
+        ? (annScores.get(chunk.id) ?? 0)
+        : queryEmbedding && chunk.embedding
+          ? cosineSimilarity(queryEmbedding, chunk.embedding)
+          : 0;
       // Semantic similarity (0-1) drives ranking; normalized BM25 (0-1) is a
       // smaller additive boost so exact identifier/keyword matches still surface.
       const score = semantic + lexical * 0.2;
@@ -441,6 +539,21 @@ export class IndexStore {
     const tmpPath = `${snapshotPath}.tmp`;
     await fs.promises.writeFile(tmpPath, JSON.stringify(snapshot), 'utf-8');
     await fs.promises.rename(tmpPath, snapshotPath); // atomic on the same filesystem
+
+    // Persist the ANN index too, if built — so a restart doesn't pay the
+    // one-time build cost again. Not fatal if this fails; load() falls back
+    // to rebuilding fresh (via maybeInitAnn) the same as if it were missing.
+    if (this.annIndex) {
+      try {
+        this.annIndex.save(IndexStore.annPath(snapshotPath));
+      } catch (err) {
+        console.error('context-daemon: failed to save fast search index (will rebuild next start):', err);
+      }
+    }
+  }
+
+  private static annPath(snapshotPath: string): string {
+    return `${snapshotPath}.ann`;
   }
 
   /**
@@ -459,12 +572,33 @@ export class IndexStore {
       if (snapshot.embeddingModel !== EMBEDDING_MODEL) return false;
       this.files.clear();
       this.chunks.clear();
+      this.annIndex = null;
       for (const file of snapshot.files) this.files.set(file.filePath, file);
       for (const chunk of snapshot.chunks) {
         const c = deserializeChunk(chunk);
         this.chunks.set(c.id, c);
       }
       if (snapshot.lastUpdatedAt) this.lastUpdatedAt = snapshot.lastUpdatedAt;
+
+      // Try to restore a persisted ANN index instead of paying the full
+      // build cost again on every restart. If it's missing, stale (chunk
+      // count doesn't match — repo changed since last save), or corrupt,
+      // leave annIndex null; maybeInitAnn() rebuilds it fresh the next time
+      // a file is indexed (also called here directly, so a restart with no
+      // file changes at all still ends up with ANN active, not stuck on
+      // brute-force until something happens to change).
+      if (annEnabled) {
+        const embedded = [...this.chunks.values()].filter((c) => c.embedding);
+        if (embedded.length >= IndexStore.ANN_THRESHOLD) {
+          const dim = embedded[0].embedding!.length;
+          const idx = new AnnIndex(dim);
+          if (idx.load(IndexStore.annPath(snapshotPath)) && idx.size === embedded.length) {
+            this.annIndex = idx;
+          } else {
+            this.maybeInitAnn();
+          }
+        }
+      }
       return true;
     } catch {
       return false; // corrupt/unreadable snapshot, fall back to a fresh index

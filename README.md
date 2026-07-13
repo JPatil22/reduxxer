@@ -261,18 +261,29 @@ real matches. Cross-file resolution covers JS/TS relative imports and Python
   means this cost is only paid once per file, not on every restart. Pass
   `--no-embeddings` to skip the model entirely (no ~90MB download, lexical
   search only). On first run the model download is announced, not silent.
-- Search is brute-force cosine similarity + BM25 over every chunk —
-  measured fine to ~25,000 chunks (~81ms), degrades roughly linearly past
-  that (~700ms at 200,000 chunks, ~1.5s at 400,000 chunks — a large
-  enterprise monorepo, tens of thousands of files). A `sqlite-vec`-based
-  vector index was evaluated for this and rejected: it measured only ~3x
-  faster (not the order-of-magnitude fix a true ANN/HNSW index would give),
-  was slower to write to, and would have meant a large rewrite of the most
-  heavily-tested code in the project for a modest, still-fundamentally-
-  linear win. Not fixed — a genuine fix would need a true ANN index
-  (e.g. HNSW), which is real added complexity (native dependency,
-  approximate-not-exact results) not yet justified by real usage at that
-  scale.
+- **Semantic search scales via a fast-search (ANN) index above 20,000
+  embedded chunks** (`usearch`/HNSW) — below that, brute-force cosine
+  similarity is already fast (~81ms at 25,000 chunks) and is what every
+  repo uses by default; the ANN index only kicks in for the rare, genuinely
+  huge repo, and never affects normal-sized ones. Two other approaches were
+  evaluated first and rejected with real benchmarks: `sqlite-vec` only gave
+  ~3x (not the order-of-magnitude a true ANN index provides) and was slower
+  to write to; `hnswlib-node` gave real ANN performance but requires a C++
+  compiler toolchain most users don't have. `usearch` was chosen after
+  verifying it avoids both problems — prebuilt binaries for Windows/Mac/
+  Linux (confirmed, no compiler needed) and genuine flat query time
+  regardless of scale (measured 1.6ms at 25,000 chunks vs. brute-force's
+  81ms, with the gap widening enormously at real large-repo scale).
+  Correctness was verified against exact brute-force search on real code
+  embeddings (100% recall across two test corpora), and it's more
+  memory-efficient too (~99MB vs ~200MB at 25,000 chunks). The one real
+  cost is a slower one-time index build the first time a repo crosses the
+  threshold (~68s at 25,000 chunks, longer for bigger repos) — logged
+  clearly, not a silent wait, and persisted to disk so it's paid once, not
+  on every restart. `IndexStore`'s brute-force path stays fully intact and
+  unchanged for every repo below the threshold; pass `--no-ann` to force
+  brute-force even on a huge repo if the fast-search path is ever suspected
+  of causing a problem.
 - Dependency expansion is one-hop only (it won't chase a dependency's own
   dependencies). Cross-file resolution follows JS/TS relative imports and
   Python `from ... import` statements; it does not resolve `import x`

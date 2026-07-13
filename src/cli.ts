@@ -2,7 +2,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { IndexStore } from './store.js';
+import { IndexStore, setAnnEnabled } from './store.js';
 import { indexRepo, watchRepo } from './watcher.js';
 import { startMcpServer } from './mcpServer.js';
 import { startHttpMcpServer } from './httpServer.js';
@@ -13,6 +13,10 @@ const [, , command, ...rest] = process.argv;
 if (rest.includes('--no-embeddings')) {
   disableEmbeddings();
   console.error('context-daemon: --no-embeddings set — lexical-only search, no model download.');
+}
+if (rest.includes('--no-ann')) {
+  setAnnEnabled(false);
+  console.error('context-daemon: --no-ann set — always using brute-force search, even on large repos.');
 }
 // Resolve to absolute so the snapshot location and the indexed file paths
 // are canonical no matter whether the repo was passed as "." or a full path.
@@ -119,6 +123,11 @@ async function main() {
   --no-embeddings  (any command)                 Skip the embedding model entirely: no ~90MB download,
                                                  no inference. Search falls back to lexical-only — faster
                                                  to start, but no semantic/paraphrase matching.
+
+  --no-ann  (any command)                        Always use brute-force search, even on repos large enough
+                                                 to normally switch to the fast-search (ANN) index. Explicit
+                                                 escape hatch back to the simpler, always-available path if
+                                                 the fast-search index is ever suspected of causing a problem.
 `);
 }
 

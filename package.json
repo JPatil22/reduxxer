@@ -47,6 +47,7 @@
     "ignore": "^7.0.6",
     "porter-stemmer": "^0.9.1",
     "typescript": "^5.5.4",
+    "usearch": "^2.26.0",
     "zod": "^3.23.8"
   },
   "devDependencies": {

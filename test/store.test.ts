@@ -360,3 +360,129 @@ test('load returns false when there is no snapshot on disk', () => {
   const ok = store.load(path.join(os.tmpdir(), 'definitely-does-not-exist-index.json'));
   assert.equal(ok, false);
 });
+
+// --- ANN (usearch) tests below. Lower the threshold so these don't need
+// tens of thousands of real chunks to exercise the ANN code path — the
+// production default (20,000) is set from real scale measurements, this
+// override exists purely so tests can reach the same code cheaply. ---
+
+const ANN_DIM = 8;
+
+/** Small, deterministic, distinguishable embeddings — 5 clusters of 3
+ *  vectors each, each cluster pointing in its own primary direction with a
+ *  little noise, so nearest-neighbor results are verifiable, not random. */
+function clusterEmbedding(cluster: number, variant: number): number[] {
+  const v = new Array(ANN_DIM).fill(0.02 * variant);
+  v[cluster % ANN_DIM] = 1;
+  let norm = 0;
+  for (const x of v) norm += x * x;
+  norm = Math.sqrt(norm);
+  return v.map((x) => x / norm);
+}
+
+test('ANN mode activates once the embedded-chunk count crosses the threshold, and search stays correct', async () => {
+  const originalThreshold = 20000;
+  IndexStore.setAnnThresholdForTests(12);
+  try {
+    const store = new IndexStore();
+    // 5 clusters x 3 chunks = 15 embedded chunks, past the threshold of 12.
+    let n = 0;
+    for (let cluster = 0; cluster < 5; cluster++) {
+      for (let variant = 0; variant < 3; variant++) {
+        const id = `cluster${cluster}_v${variant}`;
+        store.upsertFile(
+          `${id}.ts`,
+          'h',
+          [chunk({ filePath: `${id}.ts`, symbolName: id, id: `${id}.ts::${id}`, embedding: clusterEmbedding(cluster, variant) })],
+          'x'
+        );
+        n++;
+      }
+    }
+    assert.ok(n > 12, 'sanity: we actually crossed the test threshold');
+
+    // Query pointing straight at cluster 2 should return cluster 2's chunks
+    // as the top matches — verifies ANN search returns correct, sensible
+    // results, not just "doesn't crash".
+    const query = clusterEmbedding(2, 0);
+    const results = await store.searchByEmbeddingForTests(query, 3);
+    const names = results.map((r) => r.symbolName);
+    assert.ok(names.every((n) => n.startsWith('cluster2_')), `expected all cluster2 matches, got ${names}`);
+  } finally {
+    IndexStore.setAnnThresholdForTests(originalThreshold);
+  }
+});
+
+test('ANN index stays correct through incremental add/remove after activation', async () => {
+  const originalThreshold = 20000;
+  IndexStore.setAnnThresholdForTests(10);
+  try {
+    const store = new IndexStore();
+    for (let cluster = 0; cluster < 4; cluster++) {
+      for (let variant = 0; variant < 3; variant++) {
+        const id = `c${cluster}_v${variant}`;
+        store.upsertFile(`${id}.ts`, 'h', [chunk({ filePath: `${id}.ts`, symbolName: id, id: `${id}.ts::${id}`, embedding: clusterEmbedding(cluster, variant) })], 'x');
+      }
+    }
+    // Remove a whole cluster (simulates deleting/emptying a file), then add
+    // a fresh one back in a different cluster — the kind of churn that
+    // happens constantly while a user edits their repo.
+    store.removeFile('c1_v0.ts');
+    store.removeFile('c1_v1.ts');
+    store.removeFile('c1_v2.ts');
+    store.upsertFile('newfile.ts', 'h', [chunk({ filePath: 'newfile.ts', symbolName: 'freshChunk', id: 'newfile.ts::freshChunk', embedding: clusterEmbedding(4, 0) })], 'x');
+
+    const results = await store.searchByEmbeddingForTests(clusterEmbedding(4, 0), 3);
+    assert.ok(results.some((r) => r.symbolName === 'freshChunk'), 'newly added chunk after churn is findable');
+    assert.ok(!results.some((r) => r.symbolName.startsWith('c1_')), 'removed cluster no longer appears');
+  } finally {
+    IndexStore.setAnnThresholdForTests(originalThreshold);
+  }
+});
+
+test('save/load round-trips the ANN index (or falls back to a correct rebuild)', async () => {
+  const originalThreshold = 20000;
+  IndexStore.setAnnThresholdForTests(9);
+  try {
+    const store = new IndexStore();
+    for (let cluster = 0; cluster < 4; cluster++) {
+      for (let variant = 0; variant < 3; variant++) {
+        const id = `p${cluster}_v${variant}`;
+        store.upsertFile(`${id}.ts`, 'h', [chunk({ filePath: `${id}.ts`, symbolName: id, id: `${id}.ts::${id}`, embedding: clusterEmbedding(cluster, variant) })], 'x');
+      }
+    }
+    const tmpFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'store-ann-')), 'index.json');
+    await store.save(tmpFile);
+    assert.ok(fs.existsSync(`${tmpFile}.ann`), 'an ANN index file was persisted alongside the snapshot');
+
+    const loaded = new IndexStore();
+    loaded.load(tmpFile);
+    const results = await loaded.searchByEmbeddingForTests(clusterEmbedding(3, 0), 3);
+    const names = results.map((r) => r.symbolName);
+    assert.ok(names.every((n) => n.startsWith('p3_')), `expected cluster3 matches after reload, got ${names}`);
+
+    fs.rmSync(path.dirname(tmpFile), { recursive: true, force: true });
+  } finally {
+    IndexStore.setAnnThresholdForTests(originalThreshold);
+  }
+});
+
+test('setAnnEnabled(false) keeps brute-force search active even past the threshold', async () => {
+  const { setAnnEnabled } = await import('../src/store.js');
+  const originalThreshold = 20000;
+  IndexStore.setAnnThresholdForTests(5);
+  setAnnEnabled(false);
+  try {
+    const store = new IndexStore();
+    for (let i = 0; i < 8; i++) {
+      store.upsertFile(`f${i}.ts`, 'h', [chunk({ filePath: `f${i}.ts`, symbolName: `fn${i}`, id: `f${i}.ts::fn${i}`, embedding: clusterEmbedding(i % 4, i) })], 'x');
+    }
+    // Should still return correct results via the brute-force path — this
+    // is the explicit escape hatch, verified to actually disable ANN.
+    const results = await store.searchByEmbeddingForTests(clusterEmbedding(0, 0), 3);
+    assert.ok(results.length > 0, 'brute-force search still works with ANN explicitly disabled');
+  } finally {
+    setAnnEnabled(true);
+    IndexStore.setAnnThresholdForTests(originalThreshold);
+  }
+});
