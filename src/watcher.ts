@@ -75,6 +75,16 @@ const indexLimit = pLimit(8);
 // hand-written source is essentially never this large.
 const MAX_FILE_SIZE_BYTES = 1024 * 1024; // 1MB
 
+// A single file producing more chunks than this skips embedding for that
+// file — a byte-size guard alone misses a small-but-dense file (thousands
+// of tiny functions packed under the size limit). Verified: a 950KB file
+// with 22,615 functions parses fine, but sequential embedding at ~15ms/chunk
+// would take ~6 minutes for that ONE file inside a single indexFile() call.
+// No genuine hand-written file has this many top-level symbols — it's a
+// reliable signal of generated/data-like content. Chunks are still stored
+// for lexical/BM25 search, just without semantic search for that file.
+const MAX_CHUNKS_FOR_EMBEDDING = 500;
+
 /** Re-index a single file, but skip it if content hash hasn't changed. */
 export async function indexFile(store: IndexStore, filePath: string, repoRoot?: string): Promise<void> {
   return indexLimit(async () => {
@@ -90,12 +100,18 @@ export async function indexFile(store: IndexStore, filePath: string, repoRoot?: 
       const hash = hashContent(content);
       if (store.getFileHash(filePath) === hash) return; // unchanged, skip
       const chunks = await parseByExtension(filePath, content, repoRoot);
-      // One batched model call for all of this file's chunks instead of one
-      // call per chunk — amortizes tokenization/model overhead.
-      const vectors = await embedTexts(chunks.map((c) => embeddingInput(c.symbolName, c.code)));
-      chunks.forEach((chunk, i) => {
-        chunk.embedding = vectors[i];
-      });
+      if (chunks.length > MAX_CHUNKS_FOR_EMBEDDING) {
+        console.error(
+          `context-daemon: ${filePath} — ${chunks.length} symbols exceeds the ${MAX_CHUNKS_FOR_EMBEDDING}-chunk embedding limit (likely generated/data-like); indexing for keyword search only, skipping semantic embedding`
+        );
+      } else {
+        // One batched model call for all of this file's chunks instead of one
+        // call per chunk — amortizes tokenization/model overhead.
+        const vectors = await embedTexts(chunks.map((c) => embeddingInput(c.symbolName, c.code)));
+        chunks.forEach((chunk, i) => {
+          chunk.embedding = vectors[i];
+        });
+      }
       store.upsertFile(filePath, hash, chunks, content);
     } catch (err) {
       // A file vanishing between walk and read (ENOENT) is normal churn and

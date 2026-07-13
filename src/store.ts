@@ -187,9 +187,13 @@ export class IndexStore {
 
     // BM25 scores are unbounded and corpus-dependent, so normalize them to
     // [0,1] within this query (top lexical hit = 1) before blending with the
-    // semantic score, which is already [0,1].
+    // semantic score, which is already [0,1]. Reduced with a loop rather than
+    // Math.max(0, ...bm25Raw) — spreading a large array as call arguments
+    // hits V8's argument-count limit and crashes on big repos (verified: a
+    // 200,000-chunk corpus threw "Maximum call stack size exceeded" here).
     const bm25Raw = chunks.map((c) => this.bm25Score(queryTokens, c.id));
-    const bm25Max = Math.max(0, ...bm25Raw);
+    let bm25Max = 0;
+    for (const s of bm25Raw) if (s > bm25Max) bm25Max = s;
 
     const scored = chunks.map((chunk, i) => {
       // Normalized BM25, with a penalty for whole-file fallback chunks — a

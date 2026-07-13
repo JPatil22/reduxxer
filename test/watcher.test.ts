@@ -149,6 +149,26 @@ test('indexRepo skips files over the size limit, without reading their content',
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
+test('a file with an extreme number of tiny functions still indexes for keyword search, but skips embedding', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'context-daemon-densefile-'));
+  // Under the byte-size limit, but far past the chunk-count limit — e.g. a
+  // generated file packed with many tiny functions. Real hand-written files
+  // never have this many top-level symbols.
+  const lines = [];
+  for (let i = 0; i < 600; i++) lines.push(`export function fn${i}() { return ${i}; }`);
+  fs.writeFileSync(path.join(tmpDir, 'dense.ts'), lines.join('\n'));
+
+  const store = new IndexStore();
+  await indexRepo(store, tmpDir);
+
+  assert.equal(store.stats().chunks, 600, 'all functions are still indexed for keyword search');
+  const target = store.allChunks().find((c) => c.symbolName === 'fn300');
+  assert.ok(target, 'a specific function is still findable');
+  assert.equal(target!.embedding, undefined, 'embedding was skipped for this file');
+
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
 test('re-indexing an unchanged repo skips re-parsing (hash-based skip)', async () => {
   const store = new IndexStore();
   await indexRepo(store, fixtureRepo);

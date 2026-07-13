@@ -160,9 +160,8 @@ export function parseFile(filePath: string, content: string): CodeChunk[] {
     // the declaration line through the last field — not the whole class span,
     // or an AI editing by these coordinates would target the wrong lines.
     const classStart = getLineRange(node).start;
-    const headerEnd = fields.length
-      ? Math.max(classStart, ...fields.map((f) => getLineRange(f).end))
-      : classStart;
+    let headerEnd = classStart;
+    for (const f of fields) headerEnd = Math.max(headerEnd, getLineRange(f).end);
     const headerId = `${filePath}::${className}`;
     calledNamesByChunkId.set(headerId, new Set());
     chunks.push({

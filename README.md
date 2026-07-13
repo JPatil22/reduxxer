@@ -247,7 +247,12 @@ real matches. Cross-file resolution covers JS/TS relative imports and Python
 - Files over 1MB are skipped entirely (logged, not silent) — minified
   bundles and large generated files can stall the parser/embedding step
   for little benefit. Genuine hand-written source is essentially never
-  this large.
+  this large. Separately, a file *under* 1MB but producing more than 500
+  chunks (e.g. a generated file packed with thousands of tiny functions —
+  verified with a real 950KB/22,615-function file) skips embedding for
+  that file specifically: its symbols still index for keyword/BM25 search,
+  just without semantic search, since sequential embedding at that count
+  would otherwise take several minutes for a single file.
 - Embedding every chunk at index time is CPU-bound and not fast — expect
   tens of milliseconds per chunk on first index of a large repo, sequentially
   (batching many chunks into one model call was tried and measured slower
@@ -256,9 +261,18 @@ real matches. Cross-file resolution covers JS/TS relative imports and Python
   means this cost is only paid once per file, not on every restart. Pass
   `--no-embeddings` to skip the model entirely (no ~90MB download, lexical
   search only). On first run the model download is announced, not silent.
-- Search is brute-force cosine similarity over every embedded chunk — fine
-  at the thousands-of-chunks scale this has been tested at, not verified
-  at tens-of-thousands-of-chunks monorepo scale.
+- Search is brute-force cosine similarity + BM25 over every chunk —
+  measured fine to ~25,000 chunks (~81ms), degrades roughly linearly past
+  that (~700ms at 200,000 chunks, ~1.5s at 400,000 chunks — a large
+  enterprise monorepo, tens of thousands of files). A `sqlite-vec`-based
+  vector index was evaluated for this and rejected: it measured only ~3x
+  faster (not the order-of-magnitude fix a true ANN/HNSW index would give),
+  was slower to write to, and would have meant a large rewrite of the most
+  heavily-tested code in the project for a modest, still-fundamentally-
+  linear win. Not fixed — a genuine fix would need a true ANN index
+  (e.g. HNSW), which is real added complexity (native dependency,
+  approximate-not-exact results) not yet justified by real usage at that
+  scale.
 - Dependency expansion is one-hop only (it won't chase a dependency's own
   dependencies). Cross-file resolution follows JS/TS relative imports and
   Python `from ... import` statements; it does not resolve `import x`
