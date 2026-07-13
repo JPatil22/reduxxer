@@ -270,4 +270,8 @@ real matches. Cross-file resolution covers JS/TS relative imports and Python
 ## Suggested next steps
 
 - Persist the token-savings log alongside the index snapshot.
-- Package for `npx context-daemon` / global install instead of clone + build.
+- Publish to npm as `tokenreduxxer` so `npx tokenreduxxer <repo>` works without
+  cloning. The packaging itself is done and verified — a real `npm pack` +
+  isolated global install was tested end to end (JS/TS and Python indexing
+  both confirmed working from the installed layout, not just the source
+  tree) — just not published yet.

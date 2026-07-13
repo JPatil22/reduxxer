@@ -1,19 +1,45 @@
 {
-  "name": "context-daemon",
+  "name": "tokenreduxxer",
   "version": "0.2.0",
-  "description": "A local daemon that incrementally indexes a JS/TS repo and serves targeted code context over MCP, instead of AI coding tools re-reading whole files/repo every time.",
+  "description": "A local daemon that incrementally indexes a JS/TS/Python repo and serves targeted code context over MCP, instead of AI coding tools re-reading whole files/repo every time.",
   "type": "module",
   "bin": {
-    "context-daemon": "./dist/src/cli.js"
+    "tokenreduxxer": "./dist/src/cli.js"
+  },
+  "files": [
+    "dist/src",
+    "python",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
   },
   "scripts": {
     "build": "tsc -p .",
+    "prepublishOnly": "npm run build",
     "index": "node dist/src/cli.js index",
     "watch": "node dist/src/cli.js watch",
     "mcp": "node dist/src/cli.js mcp",
     "benchmark": "node dist/demo/benchmark.js",
     "test": "node --test dist/test/*.test.js"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/JPatil22/reduxxer.git"
+  },
+  "homepage": "https://github.com/JPatil22/reduxxer",
+  "bugs": {
+    "url": "https://github.com/JPatil22/reduxxer/issues"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "claude-code",
+    "cursor",
+    "ai-coding",
+    "code-search",
+    "token-savings"
+  ],
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.7.0",
     "@xenova/transformers": "^2.17.2",
