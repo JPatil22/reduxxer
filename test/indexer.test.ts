@@ -112,6 +112,29 @@ test('parseFile extracts functions from a Svelte <script> block', () => {
   assert.equal(chunks[0].startLine, 2);
 });
 
+test('parseFile captures ALL script blocks in a Vue SFC (script + script setup)', () => {
+  const sfc = [
+    '<template>',
+    '  <div>{{ x }}</div>',
+    '</template>',
+    '',
+    '<script>',
+    'export function legacy() { return 1; }',
+    '</script>',
+    '',
+    '<script setup lang="ts">',
+    'function setupFn() { return 2; }',
+    '</script>',
+  ].join('\n');
+  const chunks = parseFile('Widget.vue', sfc);
+  const byName = new Map(chunks.map((c) => [c.symbolName, c]));
+  assert.ok(byName.has('legacy'), 'first <script> block is captured');
+  assert.ok(byName.has('setupFn'), 'second <script setup> block is captured too');
+  // Line numbers map 1:1 to the source file (masking preserves positions).
+  assert.equal(byName.get('legacy')!.startLine, 6);
+  assert.equal(byName.get('setupFn')!.startLine, 10);
+});
+
 test('parseFile returns no chunks for a Vue SFC with no <script> block', () => {
   const chunks = parseFile('TemplateOnly.vue', '<template>\n  <div>static</div>\n</template>\n');
   assert.equal(chunks.length, 0);

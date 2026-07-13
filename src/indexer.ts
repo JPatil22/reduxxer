@@ -3,23 +3,38 @@ import path from 'node:path';
 import { CodeChunk } from './types.js';
 import { hashContent } from './hash.js';
 
-const SCRIPT_BLOCK = /<script[^>]*>([\s\S]*?)<\/script>/i;
+const SCRIPT_BLOCK = /<script[^>]*>([\s\S]*?)<\/script>/gi;
 
 /**
  * Vue (.vue) and Svelte (.svelte) files aren't plain JS/TS — they wrap
- * component logic in a <script> block alongside template/style markup
- * the TS compiler can't parse. Pull just that block out (with a line
- * offset so reported line numbers still point at the right place in the
- * original file) so the rest of the pipeline can treat it like a normal
- * TS/JS source string. Returns null if there's no script block to index.
+ * component logic in <script> blocks alongside template/style markup the TS
+ * compiler can't parse. Rather than extract one block, we mask everything
+ * *outside* the script blocks to blanks (preserving newlines), so:
+ *   - ALL script blocks are kept — Vue 3's `<script>` + `<script setup>`,
+ *     Svelte's `<script module>`, etc. — not just the first;
+ *   - script content stays at its original line positions, so reported line
+ *     numbers map 1:1 to the source file with no offset arithmetic.
+ * Returns null if there's no script content at all.
  */
-function extractScriptBlock(content: string): { code: string; lineOffset: number; isTs: boolean } | null {
-  const match = SCRIPT_BLOCK.exec(content);
-  if (!match || !match[1].trim()) return null;
-  const openTag = match[0].slice(0, match[0].indexOf('>') + 1);
-  const isTs = /lang\s*=\s*["']ts["']/i.test(openTag);
-  const lineOffset = content.slice(0, match.index).split('\n').length - 1;
-  return { code: match[1], lineOffset, isTs };
+function maskToScripts(content: string): string | null {
+  const ranges: Array<[number, number]> = [];
+  let match: RegExpExecArray | null;
+  SCRIPT_BLOCK.lastIndex = 0;
+  while ((match = SCRIPT_BLOCK.exec(content)) !== null) {
+    if (!match[1].trim()) continue;
+    const innerStart = match.index + match[0].indexOf('>') + 1;
+    ranges.push([innerStart, innerStart + match[1].length]);
+  }
+  if (ranges.length === 0) return null;
+
+  let out = '';
+  for (let i = 0; i < content.length; i++) {
+    const ch = content[i];
+    if (ch === '\n') out += '\n';
+    else if (ranges.some(([s, e]) => i >= s && i < e)) out += ch;
+    else out += ' ';
+  }
+  return out;
 }
 
 /**
@@ -37,10 +52,9 @@ export function parseFile(filePath: string, content: string): CodeChunk[] {
   let isTsx = filePath.endsWith('.tsx') || filePath.endsWith('.jsx');
 
   if (isSfc) {
-    const script = extractScriptBlock(content);
-    if (!script) return []; // template/style-only file, nothing to index
-    codeToParse = script.code;
-    lineOffset = script.lineOffset;
+    const masked = maskToScripts(content);
+    if (!masked) return []; // template/style-only file, nothing to index
+    codeToParse = masked; // line-aligned with the source, so no offset needed
     isTsx = false; // SFC <script> blocks are plain JS/TS, not JSX
   }
 

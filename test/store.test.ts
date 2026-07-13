@@ -301,6 +301,21 @@ test('save/load round-trips an embedding through the base64 Float32 format', asy
   }
 });
 
+test('save writes atomically (via a temp file) and leaves no .tmp behind', async () => {
+  const store = new IndexStore();
+  store.upsertFile('a.ts', 'h', [chunk({})], 'x');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'store-atomic-'));
+  const target = path.join(dir, 'index.json');
+
+  await store.save(target);
+
+  assert.ok(fs.existsSync(target), 'the snapshot exists');
+  assert.ok(!fs.existsSync(`${target}.tmp`), 'no leftover temp file');
+  // The final file is complete and parseable (not a half-written fragment).
+  const parsed = JSON.parse(fs.readFileSync(target, 'utf-8'));
+  assert.equal(parsed.version, 1);
+});
+
 test('load refuses a snapshot written by a different embedding model', async () => {
   const store = new IndexStore();
   store.upsertFile('a.ts', 'hash1', [chunk({})], 'function foo() {}');

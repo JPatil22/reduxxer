@@ -409,7 +409,12 @@ export class IndexStore {
     };
   }
 
-  /** Writes the whole index to disk as JSON, without blocking the event loop. */
+  /**
+   * Writes the whole index to disk as JSON, without blocking the event loop.
+   * Atomic: writes to a temp file and renames it over the target, so a crash
+   * or Ctrl+C mid-write can't leave a half-written (corrupt) snapshot that
+   * would make the next startup silently discard the whole index.
+   */
   async save(snapshotPath: string): Promise<void> {
     const snapshot: IndexSnapshot = {
       version: 1,
@@ -419,7 +424,9 @@ export class IndexStore {
       chunks: [...this.chunks.values()].map(serializeChunk),
     };
     await fs.promises.mkdir(path.dirname(snapshotPath), { recursive: true });
-    await fs.promises.writeFile(snapshotPath, JSON.stringify(snapshot), 'utf-8');
+    const tmpPath = `${snapshotPath}.tmp`;
+    await fs.promises.writeFile(tmpPath, JSON.stringify(snapshot), 'utf-8');
+    await fs.promises.rename(tmpPath, snapshotPath); // atomic on the same filesystem
   }
 
   /**

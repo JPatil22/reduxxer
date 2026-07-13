@@ -136,6 +136,10 @@ export function watchRepo(
     ignored: (filePath: string) => isIgnored(ig, rootDir, filePath),
     ignoreInitial: true,
     persistent: true,
+    // A `change` event can fire mid-write (an editor saving, `git pull`
+    // rewriting a file), so reading immediately can grab a partial or empty
+    // file and index garbage. Wait until the file has stopped growing.
+    awaitWriteFinish: { stabilityThreshold: 150, pollInterval: 50 },
   });
 
   watcher.on('add', async (filePath) => {
