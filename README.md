@@ -187,11 +187,14 @@ and **BM25** (lexical). BM25 is the standard information-retrieval scorer —
 it weights rare query terms higher via IDF (so `bm25Score` surfaces for
 "bm25 ranking" but a ubiquitous word like `process` barely moves the
 ranking), saturates repeated terms, and normalizes for document length.
-Identifiers are split on camelCase (`getUserById` → get/user/by/id) so
-identifier searches work. Combining the two covers both paraphrased queries
-("terminate a user's session" → `logout`) and exact identifier lookups.
-Whole-file fallback chunks and test files are de-prioritized/excluded so
-they don't drown out real symbol matches.
+Identifiers are split on camelCase (`getUserById` → get/user/by/id), and
+every token is reduced to a root form with a Porter stemmer, so "running"
+matches a function called `run_process` and "handled" matches `handleRequest`
+— without needing embeddings to bridge the gap. Combining BM25 with semantic
+similarity covers both paraphrased queries ("terminate a user's session" →
+`logout`) and exact identifier lookups. Whole-file fallback chunks and test
+files are de-prioritized/excluded so they don't drown out real symbol
+matches.
 
 Alongside functions and classes, each file also produces a **module-header
 chunk** — its imports, re-exports, top-level constants/config, and type

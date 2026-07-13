@@ -139,6 +139,27 @@ test('BM25 ranking: a chunk with a rare query term outranks ones sharing only co
   assert.equal(results[0].symbolName, 'target');
 });
 
+test('stemming: "running" matches a function named run_process (no embeddings involved)', async () => {
+  const store = new IndexStore();
+  store.upsertFile(
+    'proc.ts',
+    'h',
+    [
+      chunk({
+        symbolName: 'run_process',
+        code: "function run_process(id) { console.log('processing', id); }",
+        id: 'proc.ts::run_process',
+      }),
+    ],
+    'x'
+  );
+  // No embedding on the chunk, so this exercises stemmed BM25 + the
+  // relevance gate only — "running"/"process" both stem to match tokens
+  // ("run", "process") in run_process, via camelCase/underscore splitting.
+  const results = await store.search('running the process');
+  assert.ok(results.some((r) => r.symbolName === 'run_process'));
+});
+
 test('short identifiers like "id" and "db" are not dropped from matching', async () => {
   const store = new IndexStore();
   store.upsertFile(

@@ -3,6 +3,7 @@ import path from 'node:path';
 import { CodeChunk, FileRecord, SearchLogEntry } from './types.js';
 import { estimateTokens } from './tokens.js';
 import { embedText, cosineSimilarity, EMBEDDING_MODEL } from './embeddings.js';
+import { memoizingStemmer as stemmer } from 'porter-stemmer';
 
 // On disk, a chunk's embedding is a base64 Float32 string (`emb`) rather than
 // a JSON array of ~384 full-precision numbers — roughly 3x smaller on disk.
@@ -94,14 +95,16 @@ export class IndexStore {
     return [...this.chunks.values()];
   }
 
-  /** Content words from a query — drops short tokens and common filler so a
-   *  single letter like "a" in "render a chart" can't match every chunk and
-   *  inflate lexical relevance. */
+  /** Content words from a query, stemmed — drops short tokens and common
+   *  filler so a single letter like "a" in "render a chart" can't match
+   *  every chunk, and reduces words to a root form ("running" -> "run") so
+   *  the relevance gate recognizes the same matches BM25 scores on. */
   private queryTerms(query: string): string[] {
     return query
       .toLowerCase()
       .split(/\W+/)
-      .filter((t) => t.length >= 2 && !IndexStore.STOPWORDS.has(t));
+      .filter((t) => t.length >= 2 && !IndexStore.STOPWORDS.has(t))
+      .map((t) => stemmer(t));
   }
 
   // BM25 tuning: k1 controls term-frequency saturation, b controls how much
@@ -110,14 +113,18 @@ export class IndexStore {
   private static readonly BM25_B = 0.75;
 
   /** Tokenizes code/text for BM25: splits on non-alphanumerics and camelCase
-   *  boundaries so `getUserById` contributes get/user/by/id, lowercased. No
-   *  stopword filtering — BM25's IDF down-weights common words on its own. */
+   *  boundaries so `getUserById` contributes get/user/by/id, lowercased, then
+   *  stemmed to a root form (Porter stemmer) so "running"/"runs" and a
+   *  function named "run" or "run_process" share a token instead of missing
+   *  each other on exact spelling. No stopword filtering — BM25's IDF
+   *  down-weights common words on its own. */
   private tokenize(text: string): string[] {
     return text
       .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
       .toLowerCase()
       .split(/[^a-z0-9]+/)
-      .filter((t) => t.length >= 2);
+      .filter((t) => t.length >= 2)
+      .map((t) => stemmer(t));
   }
 
   /** Rebuilds BM25 corpus statistics from the current chunks. Lazy: only
@@ -205,9 +212,12 @@ export class IndexStore {
       //    matches that score low semantically in tiny repos).
       // A query for functionality that doesn't exist shares at most one
       // incidental word and has low similarity, so it clears none of these
-      // and returns nothing instead of the nearest wrong chunk.
-      const haystack = (chunk.symbolName + ' ' + chunk.code).toLowerCase();
-      const distinctTerms = terms.filter((t) => haystack.includes(t)).length;
+      // and returns nothing instead of the nearest wrong chunk. Checked
+      // against the same stemmed token set BM25 scores on (exact token
+      // membership, not a raw substring scan — avoids false positives like
+      // "art" matching inside "start").
+      const doc = this.bm25Docs.get(chunk.id);
+      const distinctTerms = doc ? terms.filter((t) => doc.tf.has(t)).length : 0;
       const nameHit = normalizedQuery.length > 0 && chunk.symbolName.toLowerCase().includes(normalizedQuery);
       const relevant =
         nameHit || (queryEmbedding !== null && semantic >= IndexStore.SEMANTIC_FLOOR) || distinctTerms >= 2;
