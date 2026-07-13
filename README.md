@@ -286,10 +286,13 @@ real matches. Cross-file resolution covers JS/TS relative imports and Python
   unchanged for every repo below the threshold; pass `--no-ann` to force
   brute-force even on a huge repo if the fast-search path is ever suspected
   of causing a problem.
-- Dependency expansion is one-hop only (it won't chase a dependency's own
-  dependencies). Cross-file resolution follows JS/TS relative imports and
+- Dependency expansion chases a chain up to 2 hops deep (A -> B -> C), capped
+  at 4 pulled-in chunks total so it can't dwarf the real matches. Cross-file
+  resolution follows JS/TS relative imports, tsconfig/jsconfig `paths`
+  aliases (e.g. `@/utils/x`, matched against the repo-root config), and
   Python `from ... import` statements; it does not resolve `import x`
-  followed by `x.y()` attribute calls, or non-relative package imports.
+  followed by `x.y()` attribute calls, or imports of genuine external
+  packages (react, lodash, ...).
 - The HTTP transport is localhost-only with a per-repo bearer token, not
   meant to be exposed beyond the machine it runs on.
 

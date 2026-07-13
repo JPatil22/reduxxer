@@ -1,7 +1,67 @@
 import ts from 'typescript';
 import path from 'node:path';
+import fs from 'node:fs';
 import { CodeChunk } from './types.js';
 import { hashContent } from './hash.js';
+
+interface TsPathConfig {
+  baseUrl: string; // absolute
+  paths: Record<string, string[]>;
+}
+
+// Parsed once per repo root and reused for every file — tsconfig.json rarely
+// changes mid-session, and re-reading/parsing it per file would be wasteful.
+const tsConfigCache = new Map<string, TsPathConfig | null>();
+
+/** Loads `compilerOptions.paths`/`baseUrl` from tsconfig.json or
+ *  jsconfig.json at the repo root, so non-relative imports like `@/utils/x`
+ *  can be resolved to an in-repo file instead of being treated as an
+ *  external package (and silently dropped from dependency expansion). */
+function loadTsConfig(repoRoot: string): TsPathConfig | null {
+  if (tsConfigCache.has(repoRoot)) return tsConfigCache.get(repoRoot)!;
+  let config: TsPathConfig | null = null;
+  for (const name of ['tsconfig.json', 'jsconfig.json']) {
+    const configPath = path.join(repoRoot, name);
+    try {
+      const raw = fs.readFileSync(configPath, 'utf-8');
+      // tsconfig allows comments/trailing commas, hence TS's own parser.
+      const parsed = ts.parseConfigFileTextToJson(configPath, raw);
+      const paths = parsed.config?.compilerOptions?.paths;
+      if (!paths) continue;
+      const baseUrl = path.resolve(repoRoot, parsed.config.compilerOptions.baseUrl ?? '.');
+      config = { baseUrl, paths };
+      break;
+    } catch {
+      continue; // file missing or unparseable, try the next candidate
+    }
+  }
+  tsConfigCache.set(repoRoot, config);
+  return config;
+}
+
+/** Resolves a non-relative import specifier against tsconfig `paths`
+ *  patterns (e.g. `@/*` -> `src/*`, or an exact alias with no wildcard).
+ *  Returns an absolute path prefix (no extension) or null if no pattern
+ *  matches, in which case the import is treated as a real external package. */
+function resolveTsAlias(spec: string, config: TsPathConfig): string | null {
+  for (const [pattern, targets] of Object.entries(config.paths)) {
+    const star = pattern.indexOf('*');
+    if (star < 0) {
+      if (pattern !== spec) continue;
+      const target = targets[0];
+      if (!target) continue;
+      return path.resolve(config.baseUrl, target);
+    }
+    const prefix = pattern.slice(0, star);
+    const suffix = pattern.slice(star + 1);
+    if (!spec.startsWith(prefix) || !spec.endsWith(suffix)) continue;
+    const matched = spec.slice(prefix.length, spec.length - suffix.length);
+    const target = targets[0];
+    if (!target) continue;
+    return path.resolve(config.baseUrl, target.replace('*', matched));
+  }
+  return null;
+}
 
 const SCRIPT_BLOCK = /<script[^>]*>([\s\S]*?)<\/script>/gi;
 
@@ -43,7 +103,7 @@ function maskToScripts(content: string): string | null {
  * No native bindings required, works for .js/.ts/.tsx/.jsx directly, and
  * for the <script> block of .vue/.svelte single-file components.
  */
-export function parseFile(filePath: string, content: string): CodeChunk[] {
+export function parseFile(filePath: string, content: string, repoRoot?: string): CodeChunk[] {
   const fileHash = hashContent(content);
   const isSfc = filePath.endsWith('.vue') || filePath.endsWith('.svelte');
 
@@ -204,17 +264,29 @@ export function parseFile(filePath: string, content: string): CodeChunk[] {
   visit(sourceFile);
 
   // Map each locally-bound imported name to the target file (resolved,
-  // without extension) and the original exported name. Only relative
-  // imports are tracked — package imports (react, lodash, ...) aren't in
-  // the index. `import { validateUser as vu } from './auth'` records
+  // without extension) and the original exported name. Relative imports
+  // resolve directly; non-relative ones are checked against tsconfig/
+  // jsconfig `paths` aliases (e.g. `@/utils/x`) when a repo root is known —
+  // anything else is a real external package (react, lodash, ...) and isn't
+  // in the index. `import { validateUser as vu } from './auth'` records
   // vu -> { pathPrefix: <dir>/auth, originalName: validateUser }.
   const importMap = new Map<string, { pathPrefix: string; originalName: string }>();
   const fileDir = path.dirname(filePath);
+  const tsConfig = repoRoot ? loadTsConfig(repoRoot) : null;
   for (const stmt of sourceFile.statements) {
     if (!ts.isImportDeclaration(stmt) || !ts.isStringLiteral(stmt.moduleSpecifier)) continue;
     const spec = stmt.moduleSpecifier.text;
-    if (!spec.startsWith('.')) continue; // only relative (in-repo) imports
-    const pathPrefix = path.resolve(fileDir, spec).replace(/\.(ts|tsx|js|jsx)$/, '');
+    let resolved: string;
+    if (spec.startsWith('.')) {
+      resolved = path.resolve(fileDir, spec);
+    } else if (tsConfig) {
+      const aliased = resolveTsAlias(spec, tsConfig);
+      if (!aliased) continue; // no matching alias, a real external package
+      resolved = aliased;
+    } else {
+      continue; // no tsconfig/jsconfig paths known, treat as external package
+    }
+    const pathPrefix = resolved.replace(/\.(ts|tsx|js|jsx)$/, '');
     const clause = stmt.importClause;
     if (!clause) continue;
     if (clause.name) importMap.set(clause.name.text, { pathPrefix, originalName: clause.name.text });

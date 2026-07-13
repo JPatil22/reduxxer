@@ -383,28 +383,46 @@ export class IndexStore {
     return undefined;
   }
 
-  /** Appends the top result's direct dependencies — both same-file
-   *  (`references`) and imported-from-another-file (`externalRefs`) — if not
-   *  already present, capped so expansion can't dwarf the real matches. This
-   *  is what lets the daemon hand over an imported function alongside the
-   *  function that uses it, instead of leaving the caller to go read the
-   *  other file itself. */
+  /** Appends the top result's dependencies — both same-file (`references`)
+   *  and imported-from-another-file (`externalRefs`) — chasing up to
+   *  MAX_HOPS deep (A -> B -> C, not just A -> B), if not already present,
+   *  capped so expansion can't dwarf the real matches. This is what lets the
+   *  daemon hand over an imported function alongside the function that uses
+   *  it, instead of leaving the caller to go read the other file itself.
+   *  Cycles (A -> B -> A) are safe: a chunk already added is never
+   *  re-enqueued, so the frontier shrinks to nothing rather than looping. */
   private expandWithReferences(results: CodeChunk[]): CodeChunk[] {
     const MAX_EXPANDED = 4;
+    const MAX_HOPS = 2;
     const top = results[0];
     if (!top) return results;
 
     const alreadyIncluded = new Set(results.map((r) => r.id));
     const expanded: CodeChunk[] = [];
 
-    const addChunk = (chunk: CodeChunk | undefined) => {
-      if (!chunk || expanded.length >= MAX_EXPANDED || alreadyIncluded.has(chunk.id)) return;
+    const addChunk = (chunk: CodeChunk | undefined): CodeChunk | undefined => {
+      if (!chunk || expanded.length >= MAX_EXPANDED || alreadyIncluded.has(chunk.id)) return undefined;
       expanded.push(chunk);
       alreadyIncluded.add(chunk.id);
+      return chunk;
     };
 
-    for (const refId of top.references ?? []) addChunk(this.chunks.get(refId));
-    for (const ref of top.externalRefs ?? []) addChunk(this.resolveExternalRef(ref));
+    let frontier = [top];
+    for (let hop = 0; hop < MAX_HOPS && expanded.length < MAX_EXPANDED && frontier.length > 0; hop++) {
+      const nextFrontier: CodeChunk[] = [];
+      for (const chunk of frontier) {
+        for (const refId of chunk.references ?? []) {
+          const added = addChunk(this.chunks.get(refId));
+          if (added) nextFrontier.push(added);
+        }
+        for (const ref of chunk.externalRefs ?? []) {
+          const added = addChunk(this.resolveExternalRef(ref));
+          if (added) nextFrontier.push(added);
+        }
+        if (expanded.length >= MAX_EXPANDED) break;
+      }
+      frontier = nextFrontier;
+    }
 
     return [...results, ...expanded];
   }

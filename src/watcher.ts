@@ -20,7 +20,7 @@ const TEST_FILE_PATTERN =
 function parseByExtension(filePath: string, content: string, repoRoot?: string): Promise<CodeChunk[]> {
   return filePath.endsWith('.py')
     ? parsePythonFile(filePath, content, repoRoot)
-    : Promise.resolve(parseFile(filePath, content));
+    : Promise.resolve(parseFile(filePath, content, repoRoot));
 }
 
 /** Sane baseline ignores, applied even if the repo has no .gitignore (or

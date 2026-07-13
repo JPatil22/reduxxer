@@ -158,6 +158,66 @@ test('search pulls in a Python dependency imported from another file', async () 
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
+test('search chases a multi-hop dependency chain (A -> B -> C), not just one hop', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'context-daemon-multihop-'));
+  fs.writeFileSync(
+    path.join(tmpDir, 'auth.ts'),
+    'export function checkPermission(id: string): boolean {\n  return id.length > 0;\n}\n'
+  );
+  fs.writeFileSync(
+    path.join(tmpDir, 'notify.ts'),
+    "import { checkPermission } from './auth';\n\nexport function sendAlert(id: string): boolean {\n  return checkPermission(id);\n}\n"
+  );
+  fs.writeFileSync(
+    path.join(tmpDir, 'orders.ts'),
+    "import { sendAlert } from './notify';\n\nexport function shipOrder(id: string): boolean {\n  return sendAlert(id);\n}\n"
+  );
+
+  const store = new IndexStore();
+  await indexRepo(store, tmpDir);
+
+  const results = await store.search('ship an order', 1);
+  const names = results.map((r) => r.symbolName);
+  assert.ok(names.includes('shipOrder'), 'the matched function should be returned');
+  assert.ok(names.includes('sendAlert'), 'the one-hop dependency should be pulled in');
+  assert.ok(
+    names.includes('checkPermission'),
+    'the two-hop dependency (a dependency of a dependency) should be pulled in too'
+  );
+
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+test('search resolves a tsconfig path-alias import (e.g. "@/auth"), not just relative imports', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'context-daemon-tsalias-'));
+  fs.mkdirSync(path.join(tmpDir, 'src'));
+  fs.writeFileSync(
+    path.join(tmpDir, 'tsconfig.json'),
+    JSON.stringify({ compilerOptions: { baseUrl: '.', paths: { '@/*': ['src/*'] } } })
+  );
+  fs.writeFileSync(
+    path.join(tmpDir, 'src', 'auth.ts'),
+    'export function validateUser(id: string): boolean {\n  return id.length > 0;\n}\n'
+  );
+  fs.writeFileSync(
+    path.join(tmpDir, 'src', 'orders.ts'),
+    "import { validateUser } from '@/auth';\n\nexport function processOrder(userId: string): void {\n  if (!validateUser(userId)) throw new Error('bad');\n}\n"
+  );
+
+  const store = new IndexStore();
+  await indexRepo(store, tmpDir);
+
+  const results = await store.search('process an order for a user', 1);
+  const names = results.map((r) => r.symbolName);
+  assert.ok(names.includes('processOrder'), 'the matched function should be returned');
+  assert.ok(
+    names.includes('validateUser'),
+    'the function imported via a tsconfig path alias should be pulled in too'
+  );
+
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
 test('indexRepo skips files over the size limit, without reading their content', async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'context-daemon-filesize-'));
   fs.writeFileSync(path.join(tmpDir, 'normal.ts'), 'export function normal() { return 1; }');
