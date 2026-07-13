@@ -44,6 +44,31 @@ test('indexRepo respects the target repo\'s .gitignore', async () => {
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
+test('indexRepo respects a nested .gitignore deep in a monorepo, scoped to its own subtree', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'context-daemon-nestedgitignore-'));
+  // packages/app has its own .gitignore excluding "generated/" — that rule
+  // must NOT leak out and affect packages/other, which has no such file.
+  fs.mkdirSync(path.join(tmpDir, 'packages', 'app', 'generated'), { recursive: true });
+  fs.mkdirSync(path.join(tmpDir, 'packages', 'other', 'generated'), { recursive: true });
+  fs.writeFileSync(path.join(tmpDir, 'packages', 'app', 'real.ts'), 'export function appReal() { return 1; }');
+  fs.writeFileSync(
+    path.join(tmpDir, 'packages', 'app', 'generated', 'gen.ts'),
+    'export function appGenerated() { return 1; }'
+  );
+  fs.writeFileSync(path.join(tmpDir, 'packages', 'app', '.gitignore'), 'generated/\n');
+  fs.writeFileSync(
+    path.join(tmpDir, 'packages', 'other', 'generated', 'gen.ts'),
+    'export function otherGenerated() { return 1; }'
+  );
+
+  const store = new IndexStore();
+  await indexRepo(store, tmpDir);
+  const names = store.allChunks().map((c) => c.symbolName).sort();
+  assert.deepEqual(names, ['appReal', 'otherGenerated']);
+
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
 test('indexRepo excludes test files by default', async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'context-daemon-testfiles-'));
   fs.writeFileSync(path.join(tmpDir, 'real.ts'), 'export function real() { return 1; }');

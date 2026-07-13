@@ -236,10 +236,11 @@ real matches. Cross-file resolution covers JS/TS relative imports and Python
   `<script>` blocks of Vue/Svelte single-file components — `<script>` and
   `<script setup>` together) via the TypeScript compiler API, and Python
   (`.py`) via Python's own `ast` module. No Go/Rust/Java support yet.
-- Only the repo-root `.gitignore` is read (plus a built-in ignore list —
-  `node_modules`, `dist`, `build`, `.next`, `coverage`, `__pycache__`,
-  `.venv`, … — applied at any depth). Custom ignore rules in nested
-  `.gitignore` files (deep in a monorepo) aren't picked up yet.
+- The repo-root `.gitignore` (plus a built-in ignore list — `node_modules`,
+  `dist`, `build`, `.next`, `coverage`, `__pycache__`, `.venv`, … — applied
+  at any depth) applies everywhere, and each subdirectory's own `.gitignore`
+  additionally applies to paths under it, scoped to that subtree the same
+  way git itself resolves nested `.gitignore` files in a monorepo.
 - Python support requires a `python3` or `python` interpreter on PATH —
   `.py` files are silently skipped (with a one-time warning) if neither
   is found. Only top-level functions/classes are extracted, same

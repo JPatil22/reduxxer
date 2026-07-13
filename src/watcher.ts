@@ -24,10 +24,9 @@ function parseByExtension(filePath: string, content: string, repoRoot?: string):
 }
 
 /** Sane baseline ignores, applied even if the repo has no .gitignore (or
- *  one that doesn't cover build output). Real repos also get whatever
- *  their own .gitignore excludes — which naturally solves noise like a
- *  package that ships both src/ and a compiled dist/ of the same code. */
-function loadIgnore(rootDir: string): Ignore {
+ *  one that doesn't cover build output). Combined with the root .gitignore
+ *  (if any) into one Ignore checked against paths relative to the repo root. */
+function loadBaselineIgnore(rootDir: string): Ignore {
   const ig = ignoreLib();
   ig.add([
     'node_modules',
@@ -46,14 +45,55 @@ function loadIgnore(rootDir: string): Ignore {
   try {
     ig.add(fs.readFileSync(path.join(rootDir, '.gitignore'), 'utf-8'));
   } catch {
-    // no .gitignore present, baseline ignores above still apply
+    // no root .gitignore present, baseline ignores above still apply
   }
   return ig;
 }
 
-function isIgnored(ig: Ignore, rootDir: string, fullPath: string): boolean {
-  const rel = path.relative(rootDir, fullPath).split(path.sep).join('/');
-  return rel !== '' && ig.ignores(rel);
+/** Resolves ignore rules the way git does across a monorepo: the root
+ *  .gitignore (plus baseline ignores) applies everywhere, and each
+ *  subdirectory's own .gitignore additionally applies to paths under it,
+ *  with its patterns matched relative to THAT directory, not the repo root.
+ *  Per-directory .gitignore contents are cached (read once, reused for every
+ *  file under that directory) so this stays cheap on repeated lookups. */
+class RepoIgnore {
+  private readonly baseline: Ignore;
+  private readonly dirIgnoreCache = new Map<string, Ignore | null>();
+
+  constructor(private readonly rootDir: string) {
+    this.baseline = loadBaselineIgnore(rootDir);
+  }
+
+  private getDirIgnore(dir: string): Ignore | null {
+    if (this.dirIgnoreCache.has(dir)) return this.dirIgnoreCache.get(dir)!;
+    let ig: Ignore | null = null;
+    try {
+      ig = ignoreLib().add(fs.readFileSync(path.join(dir, '.gitignore'), 'utf-8'));
+    } catch {
+      ig = null;
+    }
+    this.dirIgnoreCache.set(dir, ig);
+    return ig;
+  }
+
+  isIgnored(fullPath: string): boolean {
+    const relFromRoot = path.relative(this.rootDir, fullPath).split(path.sep).join('/');
+    if (relFromRoot === '') return false;
+    if (this.baseline.ignores(relFromRoot)) return true;
+
+    // Check every intermediate directory's own .gitignore (the root's was
+    // already folded into `baseline` above), matching the remaining path
+    // relative to that directory — a nested .gitignore's patterns are
+    // scoped to its own subtree, same as git.
+    const parts = relFromRoot.split('/');
+    let dir = this.rootDir;
+    for (let i = 0; i < parts.length - 1; i++) {
+      dir = path.join(dir, parts[i]);
+      const ig = this.getDirIgnore(dir);
+      if (ig && ig.ignores(parts.slice(i + 1).join('/'))) return true;
+    }
+    return false;
+  }
 }
 
 function isIndexable(filePath: string): boolean {
@@ -140,14 +180,14 @@ export async function indexRepo(store: IndexStore, rootDir: string): Promise<voi
   // and once as its absolute path stores every file twice (duplicate chunks,
   // wasted tokens in search results).
   rootDir = path.resolve(rootDir);
-  const ig = loadIgnore(rootDir);
+  const ig = new RepoIgnore(rootDir);
 
   const tasks: Promise<void>[] = [];
   async function walk(dir: string) {
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
       if (entry.name.startsWith('.') && entry.name !== '.') continue;
       const full = path.join(dir, entry.name);
-      if (isIgnored(ig, rootDir, full)) continue;
+      if (ig.isIgnored(full)) continue;
       if (entry.isDirectory()) {
         await walk(full);
       } else if (isIndexable(full)) {
@@ -169,9 +209,9 @@ export function watchRepo(
   // so the watcher and the initial walk must agree on path spelling or
   // change events would key differently than the indexed entries.
   rootDir = path.resolve(rootDir);
-  const ig = loadIgnore(rootDir);
+  const ig = new RepoIgnore(rootDir);
   const watcher = chokidar.watch(rootDir, {
-    ignored: (filePath: string) => isIgnored(ig, rootDir, filePath),
+    ignored: (filePath: string) => ig.isIgnored(filePath),
     ignoreInitial: true,
     persistent: true,
     // A `change` event can fire mid-write (an editor saving, `git pull`
