@@ -26,6 +26,11 @@ interface IndexSnapshot {
   lastUpdatedAt?: string;
   files: FileRecord[];
   chunks: SerializedChunk[];
+  // Token-savings tracking, persisted so the counter reflects the tool's
+  // whole lifetime on this repo instead of resetting to zero on restart.
+  searchLog?: SearchLogEntry[];
+  totalNaiveTokens?: number;
+  totalTargetedTokens?: number;
 }
 
 const SEARCH_LOG_LIMIT = 200;
@@ -534,6 +539,9 @@ export class IndexStore {
       lastUpdatedAt: this.lastUpdatedAt,
       files: [...this.files.values()],
       chunks: [...this.chunks.values()].map(serializeChunk),
+      searchLog: this.searchLog,
+      totalNaiveTokens: this.totalNaiveTokens,
+      totalTargetedTokens: this.totalTargetedTokens,
     };
     await fs.promises.mkdir(path.dirname(snapshotPath), { recursive: true });
     const tmpPath = `${snapshotPath}.tmp`;
@@ -579,6 +587,13 @@ export class IndexStore {
         this.chunks.set(c.id, c);
       }
       if (snapshot.lastUpdatedAt) this.lastUpdatedAt = snapshot.lastUpdatedAt;
+      // Restore cumulative token-savings tracking so the counter reflects
+      // this repo's whole history with the tool, not just the current
+      // process's uptime. Missing on an older snapshot (pre-this-feature)
+      // simply means starting the counters fresh, same as today's default.
+      this.searchLog = snapshot.searchLog ?? [];
+      this.totalNaiveTokens = snapshot.totalNaiveTokens ?? 0;
+      this.totalTargetedTokens = snapshot.totalTargetedTokens ?? 0;
 
       // Try to restore a persisted ANN index instead of paying the full
       // build cost again on every restart. If it's missing, stale (chunk

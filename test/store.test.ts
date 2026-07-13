@@ -322,6 +322,50 @@ test('save/load round-trips an embedding through the base64 Float32 format', asy
   }
 });
 
+test('save/load round-trips cumulative token savings across a restart', async () => {
+  const store = new IndexStore();
+  store.upsertFile('a.ts', 'h', [chunk({ symbolName: 'alpha' })], 'x');
+  store.trackSearch('find alpha', store.allChunks());
+  store.trackSearch('find alpha again', store.allChunks());
+  const before = store.tokenSavings();
+  assert.ok(before.calls > 0, 'search log recorded the calls');
+
+  const tmpFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'store-savings-')), 'index.json');
+  await store.save(tmpFile);
+
+  const loaded = new IndexStore();
+  loaded.load(tmpFile);
+  const after = loaded.tokenSavings();
+
+  assert.equal(after.calls, before.calls, 'search log entries persisted');
+  assert.equal(after.totalNaiveTokens, before.totalNaiveTokens);
+  assert.equal(after.totalTargetedTokens, before.totalTargetedTokens);
+  assert.equal(after.totalSavedTokens, before.totalSavedTokens);
+});
+
+test('load on a snapshot from before token-savings tracking existed starts counters at zero, not a crash', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'store-oldsnap-'));
+  const tmpFile = path.join(tmpDir, 'index.json');
+  const store = new IndexStore();
+  store.upsertFile('a.ts', 'h', [chunk({ symbolName: 'alpha' })], 'x');
+  await store.save(tmpFile);
+
+  // Simulate an older snapshot written before searchLog/totalNaiveTokens/
+  // totalTargetedTokens existed, by stripping those fields back out.
+  const snapshot = JSON.parse(fs.readFileSync(tmpFile, 'utf-8'));
+  delete snapshot.searchLog;
+  delete snapshot.totalNaiveTokens;
+  delete snapshot.totalTargetedTokens;
+  fs.writeFileSync(tmpFile, JSON.stringify(snapshot), 'utf-8');
+
+  const loaded = new IndexStore();
+  loaded.load(tmpFile);
+  const savings = loaded.tokenSavings();
+  assert.equal(savings.calls, 0);
+  assert.equal(savings.totalNaiveTokens, 0);
+  assert.equal(savings.totalTargetedTokens, 0);
+});
+
 test('save writes atomically (via a temp file) and leaves no .tmp behind', async () => {
   const store = new IndexStore();
   store.upsertFile('a.ts', 'h', [chunk({})], 'x');

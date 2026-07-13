@@ -176,8 +176,8 @@ Once connected, a tool can call:
 - `search_context` — natural-language query, returns the top-N relevant
   code chunks (not whole files), plus an estimated token-savings note.
 - `get_index_stats` — files/chunks indexed, last updated.
-- `get_token_savings` — cumulative estimated tokens saved this session vs.
-  the naive "read the whole file" baseline.
+- `get_token_savings` — cumulative estimated tokens saved vs. the naive
+  "read the whole file" baseline, persisted across daemon restarts.
 
 ## How search works
 
@@ -291,11 +291,9 @@ real matches. Cross-file resolution covers JS/TS relative imports and Python
   followed by `x.y()` attribute calls, or non-relative package imports.
 - The HTTP transport is localhost-only with a per-repo bearer token, not
   meant to be exposed beyond the machine it runs on.
-- Token-savings tracking is session-scoped (not persisted to the snapshot).
 
 ## Suggested next steps
 
-- Persist the token-savings log alongside the index snapshot.
 - Publish to npm as `tokenreduxxer` so `npx tokenreduxxer <repo>` works without
   cloning. The packaging itself is done and verified — a real `npm pack` +
   isolated global install was tested end to end (JS/TS and Python indexing
