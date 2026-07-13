@@ -244,14 +244,15 @@ real matches. Cross-file resolution covers JS/TS relative imports and Python
   `.py` files are silently skipped (with a one-time warning) if neither
   is found. Only top-level functions/classes are extracted, same
   granularity as the JS/TS side (a class chunk includes its methods).
-- Files over 1MB are skipped entirely (logged, not silent) — minified
+- Files over 1.5MB are skipped entirely (logged, not silent) — minified
   bundles and large generated files can stall the parser/embedding step
   for little benefit. Genuine hand-written source is essentially never
-  this large. Separately, a file *under* 1MB but producing more than 500
-  chunks (e.g. a generated file packed with thousands of tiny functions —
-  verified with a real 950KB/22,615-function file) skips embedding for
-  that file specifically: its symbols still index for keyword/BM25 search,
-  just without semantic search, since sequential embedding at that count
+  this large. Separately, a file *under* the size limit but producing more
+  than 500 chunks (e.g. a generated file packed with thousands of tiny
+  functions — verified with a real 950KB/22,615-function file) skips
+  embedding for that file specifically: its symbols still index for
+  keyword/BM25 search, just without semantic search, since sequential
+  embedding at that count
   would otherwise take several minutes for a single file.
 - Embedding every chunk at index time is CPU-bound and not fast — expect
   tens of milliseconds per chunk on first index of a large repo, sequentially

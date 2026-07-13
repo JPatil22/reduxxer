@@ -72,8 +72,10 @@ const indexLimit = pLimit(8);
 // Files past this size are skipped entirely (not even read) — minified
 // bundles and large generated files can stall the TS compiler or Python's
 // ast module and produce a giant, low-value embedding call. Genuine
-// hand-written source is essentially never this large.
-const MAX_FILE_SIZE_BYTES = 1024 * 1024; // 1MB
+// hand-written source is essentially never this large. Measured on a
+// realistic 1.5MB single-blob minified file: ~2.6s to parse, ~2s to embed
+// — real but bounded cost, vs. 11s+ at 5MB for the same shape of file.
+const MAX_FILE_SIZE_BYTES = 1.5 * 1024 * 1024; // 1.5MB
 
 // A single file producing more chunks than this skips embedding for that
 // file — a byte-size guard alone misses a small-but-dense file (thousands

@@ -136,8 +136,8 @@ test('search pulls in a Python dependency imported from another file', async () 
 test('indexRepo skips files over the size limit, without reading their content', async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'context-daemon-filesize-'));
   fs.writeFileSync(path.join(tmpDir, 'normal.ts'), 'export function normal() { return 1; }');
-  // Just over the 1MB limit.
-  fs.writeFileSync(path.join(tmpDir, 'huge.ts'), 'export function huge() {}\n// ' + 'x'.repeat(1024 * 1024 + 100));
+  // Just over the 1.5MB limit.
+  fs.writeFileSync(path.join(tmpDir, 'huge.ts'), 'export function huge() {}\n// ' + 'x'.repeat(1.5 * 1024 * 1024 + 100));
 
   const store = new IndexStore();
   await indexRepo(store, tmpDir);
