@@ -267,12 +267,75 @@ export class IndexStore {
     return this.searchWithEmbedding('', embedding, limit, this.allChunks());
   }
 
-  private async searchWithEmbedding(
+  /**
+   * Budget-based context assembly. Instead of the fixed MAX_HOPS/MAX_EXPANDED
+   * caps, this ranks candidates by relevance and then greedily includes each
+   * primary match plus its dependency closure (nearest deps first) until the
+   * rendered ghost view would exceed `tokenBudget` REAL tokens (BPE-measured,
+   * the same figure the caller pays). So the amount of context adapts to the
+   * caller's actual context window rather than a magic number, and — because
+   * opening a new file costs its header + collapsed signatures while pulling a
+   * dep from an already-open file is cheap — the greedy fill naturally favors
+   * context locality. The top match is always included even if it alone
+   * exceeds the budget (better to answer with the best chunk than nothing).
+   */
+  async searchWithinBudget(query: string, tokenBudget: number, maxPrimary = 25): Promise<CodeChunk[]> {
+    if (this.bm25Dirty) this.rebuildBm25();
+    const chunks = this.allChunks();
+    const hasEmbeddings = chunks.some((c) => c.embedding);
+    const queryEmbedding = hasEmbeddings ? await embedText(query) : null;
+    const ranked = this.rankChunks(query, queryEmbedding, maxPrimary, chunks);
+    if (ranked.length === 0) return [];
+
+    const selected: CodeChunk[] = [];
+    const selectedIds = new Set<string>();
+
+    // Add a chunk and keep it only if the newly-rendered context still fits
+    // the budget. The very first chunk is always kept so a big top match never
+    // yields an empty result. Returns whether the chunk was kept.
+    const tryAdd = (c: CodeChunk): boolean => {
+      if (selectedIds.has(c.id)) return false;
+      selected.push(c);
+      selectedIds.add(c.id);
+      const overBudget = estimateTokens(this.buildContext(selected)) > tokenBudget;
+      if (overBudget && selected.length > 1) {
+        selected.pop();
+        selectedIds.delete(c.id);
+        return false;
+      }
+      return true;
+    };
+
+    // Walk matches in rank order; for each, add it and its dependency closure
+    // (nearest deps first). A chunk that doesn't fit is SKIPPED, not a stop
+    // sign — a lower-ranked but smaller match may still fit, so we keep packing
+    // the budget with the most relevant context that fits rather than bailing
+    // on the first oversized one.
+    for (const primary of ranked) {
+      const queue: CodeChunk[] = [primary];
+      while (queue.length > 0) {
+        const c = queue.shift()!;
+        if (tryAdd(c)) {
+          for (const dep of this.directDependencies(c)) {
+            if (!selectedIds.has(dep.id)) queue.push(dep);
+          }
+        }
+      }
+    }
+
+    return selected;
+  }
+
+  /** Pure relevance ranking: scores every chunk (semantic + lexical), applies
+   *  the relevance gate, and returns the top `limit` matches — WITHOUT any
+   *  dependency expansion. Both the fixed-cap and budget-based assembly paths
+   *  build on top of this. */
+  private rankChunks(
     query: string,
     queryEmbedding: number[] | null,
     limit: number,
     chunks: CodeChunk[]
-  ): Promise<CodeChunk[]> {
+  ): CodeChunk[] {
     const normalizedQuery = query.toLowerCase().trim();
     const terms = this.queryTerms(query);
     const queryTokens = this.tokenize(query);
@@ -337,13 +400,22 @@ export class IndexStore {
       return { chunk, score, relevant };
     });
 
-    const results = scored
+    return scored
       .filter((s) => s.relevant)
       .sort((a, b) => b.score - a.score)
       .slice(0, limit)
       .map((s) => s.chunk);
+  }
 
-    return this.expandWithReferences(results);
+  /** Ranked matches plus a small, fixed dependency expansion — the default
+   *  assembly used when the caller hasn't asked for a token budget. */
+  private searchWithEmbedding(
+    query: string,
+    queryEmbedding: number[] | null,
+    limit: number,
+    chunks: CodeChunk[]
+  ): CodeChunk[] {
+    return this.expandWithReferences(this.rankChunks(query, queryEmbedding, limit, chunks));
   }
 
   // Minimum cosine similarity for a chunk to count as a semantic match. A
@@ -389,6 +461,23 @@ export class IndexStore {
     return undefined;
   }
 
+  /** The chunks a given chunk directly calls: same-file (`references`) and
+   *  imported-from-another-file (`externalRefs`, resolved against the index),
+   *  in that order. The single source of truth for "what does this depend on",
+   *  used by both the fixed-cap and budget-based expansion. */
+  private directDependencies(chunk: CodeChunk): CodeChunk[] {
+    const out: CodeChunk[] = [];
+    for (const refId of chunk.references ?? []) {
+      const c = this.chunks.get(refId);
+      if (c) out.push(c);
+    }
+    for (const ref of chunk.externalRefs ?? []) {
+      const c = this.resolveExternalRef(ref);
+      if (c) out.push(c);
+    }
+    return out;
+  }
+
   /** Appends the top result's dependencies — both same-file (`references`)
    *  and imported-from-another-file (`externalRefs`) — chasing up to
    *  MAX_HOPS deep (A -> B -> C, not just A -> B), if not already present,
@@ -396,7 +485,8 @@ export class IndexStore {
    *  daemon hand over an imported function alongside the function that uses
    *  it, instead of leaving the caller to go read the other file itself.
    *  Cycles (A -> B -> A) are safe: a chunk already added is never
-   *  re-enqueued, so the frontier shrinks to nothing rather than looping. */
+   *  re-enqueued, so the frontier shrinks to nothing rather than looping.
+   *  Used when the caller hasn't specified a token budget. */
   private expandWithReferences(results: CodeChunk[]): CodeChunk[] {
     const MAX_EXPANDED = 4;
     const MAX_HOPS = 2;
@@ -417,12 +507,8 @@ export class IndexStore {
     for (let hop = 0; hop < MAX_HOPS && expanded.length < MAX_EXPANDED && frontier.length > 0; hop++) {
       const nextFrontier: CodeChunk[] = [];
       for (const chunk of frontier) {
-        for (const refId of chunk.references ?? []) {
-          const added = addChunk(this.chunks.get(refId));
-          if (added) nextFrontier.push(added);
-        }
-        for (const ref of chunk.externalRefs ?? []) {
-          const added = addChunk(this.resolveExternalRef(ref));
+        for (const dep of this.directDependencies(chunk)) {
+          const added = addChunk(dep);
           if (added) nextFrontier.push(added);
         }
         if (expanded.length >= MAX_EXPANDED) break;

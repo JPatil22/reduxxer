@@ -65,10 +65,18 @@ export function createMcpServer(store: IndexStore, logPath?: string) {
       query: z
         .string()
         .describe('Plain-language description of the code you need, e.g. "handle user login" or "where orders get cancelled"'),
-      limit: z.number().optional().describe('Max chunks to return, default 5'),
+      limit: z.number().optional().describe('Max chunks to return, default 5. Ignored when token_budget is set.'),
+      token_budget: z
+        .number()
+        .optional()
+        .describe(
+          'If set, return as much relevant context (top matches plus the functions they depend on) as fits in about this many tokens, instead of a fixed chunk count. Tune to how much of your context window you want to spend on this lookup, e.g. 3000.'
+        ),
     },
-    async ({ query, limit }: { query: string; limit?: number }) => {
-      const results = await store.search(query, limit ?? 5);
+    async ({ query, limit, token_budget }: { query: string; limit?: number; token_budget?: number }) => {
+      const results = token_budget
+        ? await store.searchWithinBudget(query, token_budget)
+        : await store.search(query, limit ?? 5);
       if (results.length === 0) {
         return {
           content: [
