@@ -2,12 +2,15 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 import { IndexStore, setAnnEnabled } from './store.js';
-import { indexRepo, watchRepo } from './watcher.js';
+import { indexRepo, watchRepo, startReconcileLoop } from './watcher.js';
 import { startMcpServer } from './mcpServer.js';
 import { startHttpMcpServer } from './httpServer.js';
 import { disableEmbeddings } from './embeddings.js';
 import { closePythonWorker } from './pythonIndexer.js';
+import { runInit, type Client } from './setup.js';
+import { summarizeRequests, renderStats } from './stats.js';
 
 const [, , command, ...rest] = process.argv;
 if (rest.includes('--no-embeddings')) {
@@ -29,6 +32,9 @@ const useHttp = rest.includes('--http');
 const portArg = rest.find((a) => a.startsWith('--port='));
 const port = portArg ? Number(portArg.slice('--port='.length)) : 7621;
 const tokenArg = rest.find((a) => a.startsWith('--token='));
+const reconcileArg = rest.find((a) => a.startsWith('--reconcile-secs='));
+const reconcileSecs = reconcileArg ? Number(reconcileArg.slice('--reconcile-secs='.length)) : 30;
+const noReconcile = rest.includes('--no-reconcile');
 
 /** Ensures the daemon's own folder can never be committed to the user's
  *  repo — it holds the index snapshot and the plaintext HTTP auth token.
@@ -66,8 +72,40 @@ function debouncedSaver(store: InstanceType<typeof IndexStore>, delayMs = 2000) 
 
 async function main() {
   const store = new IndexStore();
-  if (command === 'index' || command === 'watch' || command === 'mcp') {
+  if (command === 'index' || command === 'watch' || command === 'mcp' || command === 'init') {
     ensureDaemonDirIgnored();
+  }
+
+  if (command === 'init') {
+    // One-command setup: wire the daemon into this repo for the chosen AI
+    // client(s), add the "use search_context first" rule, and warm the index
+    // so the first real lookup is fast. This closes the "installed but unused"
+    // gap that otherwise silently costs all the savings.
+    const clientArg = rest.find((a) => a.startsWith('--client='));
+    const choice = clientArg ? clientArg.slice('--client='.length) : 'claude';
+    const clients: Client[] = choice === 'both' ? ['claude', 'cursor'] : choice === 'cursor' ? ['cursor'] : ['claude'];
+    const cliPath = fileURLToPath(import.meta.url);
+    console.log(`Wiring context-daemon into ${repoPath} (${clients.join(' + ')}):`);
+    for (const line of runInit({ repoPath, cliPath, clients })) console.log('  ' + line);
+    if (!rest.includes('--no-index')) {
+      console.log('\nWarming the index (one-time)...');
+      store.load(snapshotPath);
+      await indexRepo(store, repoPath);
+      await store.save(snapshotPath);
+      console.log('  ' + JSON.stringify(store.stats()));
+      closePythonWorker();
+    }
+    console.log('\nDone. Next steps:');
+    console.log('  1. Restart your AI session on this repo (it reads the config at startup).');
+    console.log('  2. Ask it to find some code — it will call search_context.');
+    console.log(`  3. See savings any time:  tokenreduxxer stats "${repoPath}"`);
+    return;
+  }
+
+  if (command === 'stats') {
+    const summary = summarizeRequests(requestLogPath);
+    console.log(rest.includes('--json') ? JSON.stringify(summary, null, 2) : renderStats(summary));
+    return;
   }
 
   if (command === 'index') {
@@ -88,10 +126,12 @@ async function main() {
     console.error(JSON.stringify(store.stats(), null, 2));
     console.error('Watching for changes... (Ctrl+C to stop)');
     const saveDebounced = debouncedSaver(store);
-    watchRepo(store, repoPath, (event, filePath) => {
+    const onChange = (event: string, filePath: string) => {
       saveDebounced();
       console.error(`[${event}] re-indexed ${filePath} -> ${JSON.stringify(store.stats())}`);
-    });
+    };
+    watchRepo(store, repoPath, onChange);
+    if (!noReconcile) startReconcileLoop(store, repoPath, reconcileSecs * 1000, onChange);
     return;
   }
 
@@ -99,7 +139,9 @@ async function main() {
     store.load(snapshotPath);
     await indexRepo(store, repoPath);
     await store.save(snapshotPath);
-    watchRepo(store, repoPath, debouncedSaver(store));
+    const saveDebounced = debouncedSaver(store);
+    watchRepo(store, repoPath, saveDebounced);
+    if (!noReconcile) startReconcileLoop(store, repoPath, reconcileSecs * 1000, saveDebounced);
     if (useHttp) {
       await startHttpMcpServer(store, port, loadOrCreateToken(), requestLogPath);
     } else {
@@ -109,6 +151,13 @@ async function main() {
   }
 
   console.error(`Usage:
+  context-daemon init <repoPath> [--client=claude|cursor|both] [--no-index]
+                                                 One-command setup: wire the daemon into the repo
+                                                 (.mcp.json + a "use search_context first" rule in
+                                                 CLAUDE.md), then warm the index. Fixes the common
+                                                 "installed but never used" case. Default client: claude.
+  context-daemon stats <repoPath> [--json]      Show cumulative token savings from the audit log
+                                                 (total + per-client breakdown).
   context-daemon index <repoPath>              One-time index + print stats
   context-daemon watch <repoPath>               Index + watch + log changes as they happen
   context-daemon mcp <repoPath>                 Index + watch + serve over MCP (stdio), one client per process
@@ -120,6 +169,10 @@ async function main() {
                                                  generated once and saved to .context-daemon/http-token
                                                  (or pass --token= to set your own); clients must send
                                                  it as "Authorization: Bearer <token>".
+
+  --reconcile-secs=N / --no-reconcile (watch/mcp) Safety-net full re-scan interval (default 30s) that
+                                                 catches any file change the OS watcher missed; disable
+                                                 with --no-reconcile.
 
   --no-embeddings  (any command)                 Skip the embedding model entirely: no ~90MB download,
                                                  no inference. Search falls back to lexical-only — faster

@@ -95,6 +95,12 @@ export class IndexStore {
     return this.files.get(filePath)?.hash;
   }
 
+  /** All file paths currently in the index. Used by the reconcile sweep to
+   *  detect files that were deleted while a watch event was missed. */
+  indexedFilePaths(): string[] {
+    return [...this.files.keys()];
+  }
+
   upsertFile(filePath: string, hash: string, chunks: CodeChunk[], content: string): void {
     const old = this.files.get(filePath);
     if (old) {

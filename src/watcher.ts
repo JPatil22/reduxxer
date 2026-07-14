@@ -199,6 +199,87 @@ export async function indexRepo(store: IndexStore, rootDir: string): Promise<voi
   await Promise.all(tasks);
 }
 
+/** Safety-net sweep: re-walk the repo and reconcile the index against what's
+ *  actually on disk, so a file the OS-level watcher missed can't leave the
+ *  index permanently stale. Native FS events are unreliable on some setups
+ *  (secondary/network drives, rapid batch writes, the startup race before
+ *  chokidar's initial scan settles), so this periodic pass is the guarantee of
+ *  eventual consistency behind the fast-but-best-effort watcher.
+ *
+ *  Cheap on a quiet repo: indexFile() hashes each file and skips it if
+ *  unchanged, so the only cost is stat+read+hash of tracked files. Also prunes
+ *  files that were deleted while an unlink event was missed. */
+export async function reconcile(
+  store: IndexStore,
+  rootDir: string,
+  onChange?: (event: string, filePath: string) => void
+): Promise<void> {
+  rootDir = path.resolve(rootDir);
+  const ig = new RepoIgnore(rootDir);
+  const seen = new Set<string>();
+  const tasks: Promise<void>[] = [];
+
+  function walk(dir: string) {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return; // dir vanished mid-sweep — nothing to reconcile here
+    }
+    for (const entry of entries) {
+      if (entry.name.startsWith('.') && entry.name !== '.') continue;
+      const full = path.join(dir, entry.name);
+      if (ig.isIgnored(full)) continue;
+      if (entry.isDirectory()) {
+        walk(full);
+      } else if (isIndexable(full)) {
+        seen.add(full);
+        const before = store.getFileHash(full);
+        tasks.push(
+          indexFile(store, full, rootDir).then(() => {
+            const after = store.getFileHash(full);
+            if (after !== before) onChange?.(before ? 'change' : 'add', full);
+          })
+        );
+      }
+    }
+  }
+
+  walk(rootDir);
+  await Promise.all(tasks);
+
+  for (const filePath of store.indexedFilePaths()) {
+    if (!seen.has(filePath)) {
+      store.removeFile(filePath);
+      onChange?.('remove', filePath);
+    }
+  }
+}
+
+/** Runs `reconcile` on an interval, never overlapping a still-running sweep.
+ *  Returns a stop() to clear the timer. */
+export function startReconcileLoop(
+  store: IndexStore,
+  rootDir: string,
+  intervalMs: number,
+  onChange?: (event: string, filePath: string) => void
+): () => void {
+  let running = false;
+  const timer = setInterval(async () => {
+    if (running) return;
+    running = true;
+    try {
+      await reconcile(store, rootDir, onChange);
+    } catch (err) {
+      console.error('context-daemon: reconcile sweep failed (will retry):', err);
+    } finally {
+      running = false;
+    }
+  }, intervalMs);
+  timer.unref?.(); // don't keep the process alive just for the sweep
+  return () => clearInterval(timer);
+}
+
 /** Watches the repo and incrementally re-indexes only the file that changed. */
 export function watchRepo(
   store: IndexStore,
