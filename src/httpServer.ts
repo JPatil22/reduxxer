@@ -16,7 +16,7 @@ import { createMcpServer } from './mcpServer.js';
  * and writes through the same shared `store`, so indexing work and results
  * are shared, not duplicated.
  */
-export async function startHttpMcpServer(store: IndexStore, port: number, token: string): Promise<http.Server> {
+export async function startHttpMcpServer(store: IndexStore, port: number, token: string, logPath?: string): Promise<http.Server> {
   const sessions = new Map<string, StreamableHTTPServerTransport>();
 
   const httpServer = http.createServer(async (req, res) => {
@@ -41,7 +41,7 @@ export async function startHttpMcpServer(store: IndexStore, port: number, token:
       if (!existing) {
         // New session: pair a fresh McpServer with a fresh transport, both
         // wired to the one shared store.
-        const mcpServer = createMcpServer(store);
+        const mcpServer = createMcpServer(store, logPath);
         const transport: StreamableHTTPServerTransport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
           onsessioninitialized: (id: string) => {

@@ -24,6 +24,7 @@ const repoPath = path.resolve(rest.find((a) => !a.startsWith('--')) ?? process.c
 const daemonDir = path.join(repoPath, '.context-daemon');
 const snapshotPath = path.join(daemonDir, 'index.json');
 const tokenPath = path.join(daemonDir, 'http-token');
+const requestLogPath = path.join(daemonDir, 'requests.log');
 const useHttp = rest.includes('--http');
 const portArg = rest.find((a) => a.startsWith('--port='));
 const port = portArg ? Number(portArg.slice('--port='.length)) : 7621;
@@ -100,9 +101,9 @@ async function main() {
     await store.save(snapshotPath);
     watchRepo(store, repoPath, debouncedSaver(store));
     if (useHttp) {
-      await startHttpMcpServer(store, port, loadOrCreateToken());
+      await startHttpMcpServer(store, port, loadOrCreateToken(), requestLogPath);
     } else {
-      await startMcpServer(store);
+      await startMcpServer(store, requestLogPath);
     }
     return;
   }

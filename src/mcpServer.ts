@@ -1,14 +1,43 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import fs from 'node:fs';
 import { z } from 'zod';
 import { IndexStore } from './store.js';
+import { SearchLogEntry } from './types.js';
+
+/**
+ * Append one line per search_context call to an audit log, tagged with the
+ * name of the MCP client that made the call (e.g. "Cursor", "claude-code").
+ * This is the durable, per-client record of who is actually pulling context
+ * through the daemon and how many tokens each call saved — the shared
+ * middle-box's proof-of-work, not just an in-memory session counter.
+ */
+function appendRequestLog(logPath: string, clientName: string, query: string, entry: SearchLogEntry): void {
+  try {
+    const line = JSON.stringify({
+      ts: new Date().toISOString(),
+      client: clientName,
+      query,
+      chunks: entry.chunkCount,
+      naiveTokens: entry.naiveTokens,
+      targetedTokens: entry.targetedTokens,
+      savedTokens: entry.savedTokens,
+    });
+    fs.appendFileSync(logPath, line + '\n');
+  } catch {
+    // Logging must never break serving context.
+  }
+}
 
 /**
  * Exposes the live index over MCP so Claude Code / Cursor / Cline can
  * ask "what's relevant to X" and get back a handful of code chunks,
  * instead of the tool reading whole files into its own context.
+ *
+ * `logPath`, if given, is a file each search_context call is appended to,
+ * stamped with the calling client's name — a durable audit trail of usage.
  */
-export function createMcpServer(store: IndexStore) {
+export function createMcpServer(store: IndexStore, logPath?: string) {
   const server = new McpServer(
     { name: 'context-daemon', version: '0.2.0' },
     {
@@ -54,6 +83,10 @@ export function createMcpServer(store: IndexStore) {
       // sibling signatures) so the caller has the structure to edit safely.
       const ghost = store.buildContext(results);
       const logEntry = store.trackSearch(query, results, ghost);
+      if (logPath) {
+        const client = server.server.getClientVersion();
+        appendRequestLog(logPath, client?.name ?? 'unknown', query, logEntry);
+      }
       const text =
         ghost +
         `\n\n---\n[context-daemon] ~${logEntry.savedTokens} tokens saved this call ` +
@@ -84,8 +117,8 @@ export function createMcpServer(store: IndexStore) {
   return server;
 }
 
-export async function startMcpServer(store: IndexStore): Promise<void> {
-  const server = createMcpServer(store);
+export async function startMcpServer(store: IndexStore, logPath?: string): Promise<void> {
+  const server = createMcpServer(store, logPath);
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }
