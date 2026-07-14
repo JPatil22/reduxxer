@@ -249,11 +249,24 @@ export class IndexStore {
    * results stay grounded in what the query actually matched.
    */
   async search(query: string, limit = 5): Promise<CodeChunk[]> {
+    // Concurrency safety: embed the query FIRST (the only slow, suspending
+    // step) and take the index snapshot AFTER it. A file-watch or reconcile
+    // mutation can only land during an `await`; by snapshotting after the sole
+    // await and keeping everything below synchronous, this search always reads
+    // one consistent index state and no mutation can interleave mid-ranking.
+    // (Mutations — upsertFile/removeFile — are synchronous, so they apply
+    // atomically between, never during, a search's synchronous section.)
+    const queryEmbedding = this.hasAnyEmbedding() ? await embedText(query) : null;
     if (this.bm25Dirty) this.rebuildBm25();
     const chunks = this.allChunks();
-    const hasEmbeddings = chunks.some((c) => c.embedding);
-    const queryEmbedding = hasEmbeddings ? await embedText(query) : null;
     return this.searchWithEmbedding(query, queryEmbedding, limit, chunks);
+  }
+
+  /** Cheap "does the index hold any embedded chunk" check, used to decide
+   *  whether to pay for a query embedding before taking the ranking snapshot. */
+  private hasAnyEmbedding(): boolean {
+    for (const c of this.chunks.values()) if (c.embedding) return true;
+    return false;
   }
 
   /**
@@ -280,10 +293,12 @@ export class IndexStore {
    * exceeds the budget (better to answer with the best chunk than nothing).
    */
   async searchWithinBudget(query: string, tokenBudget: number, maxPrimary = 25): Promise<CodeChunk[]> {
+    // Same snapshot-after-embedding discipline as search(): a consistent index
+    // read even if a mutation lands during the embedding await, and the greedy
+    // assembly below is fully synchronous so nothing can mutate mid-fill.
+    const queryEmbedding = this.hasAnyEmbedding() ? await embedText(query) : null;
     if (this.bm25Dirty) this.rebuildBm25();
     const chunks = this.allChunks();
-    const hasEmbeddings = chunks.some((c) => c.embedding);
-    const queryEmbedding = hasEmbeddings ? await embedText(query) : null;
     const ranked = this.rankChunks(query, queryEmbedding, maxPrimary, chunks);
     if (ranked.length === 0) return [];
 
