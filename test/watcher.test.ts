@@ -28,6 +28,26 @@ test('indexRepo throws a clear error for a nonexistent repo path', async () => {
   await assert.rejects(() => indexRepo(store, '/definitely/not/a/real/path'), /Repo path does not exist/);
 });
 
+test('indexRepo does not follow a symlink pointing outside the repo', async (t) => {
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'cd-outside-'));
+  fs.writeFileSync(path.join(outside, 'secret.ts'), 'export function leakedSecret() { return "TOP SECRET"; }');
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'cd-repo-'));
+  fs.writeFileSync(path.join(repo, 'real.ts'), 'export function realCode() { return 1; }');
+  try {
+    // A link inside the repo, named like indexable source, pointing OUT of it.
+    fs.symlinkSync(path.join(outside, 'secret.ts'), path.join(repo, 'evil.ts'), 'file');
+  } catch {
+    t.skip('symlink creation not permitted on this platform');
+    return;
+  }
+
+  const store = new IndexStore();
+  await indexRepo(store, repo);
+  const names = store.allChunks().map((c) => c.symbolName);
+  assert.ok(names.includes('realCode'), 'the real in-repo file is indexed');
+  assert.ok(!names.includes('leakedSecret'), 'the symlinked out-of-repo file is NOT read or indexed');
+});
+
 test('indexRepo respects the target repo\'s .gitignore', async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'context-daemon-gitignore-'));
   fs.mkdirSync(path.join(tmpDir, 'src'));

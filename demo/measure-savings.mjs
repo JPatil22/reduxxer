@@ -5,12 +5,18 @@
  * For each task we compare two ways an AI could get the code it needs:
  *   - WITHOUT the daemon: read the whole file(s) that contain the relevant
  *     code (the typical fallback when hunting for/understanding code).
- *   - WITH the daemon: call search_context and use just the returned chunks.
+ *   - WITH the daemon: call search_context and use exactly what it returns —
+ *     the rendered ghost-file view (buildContext), which is what the MCP tool
+ *     actually sends the model (module header + matched symbol bodies + the
+ *     collapsed one-line signatures of every other symbol in each file). This
+ *     is deliberately NOT `results.map(r => r.code)`: the raw chunk bodies are
+ *     smaller than what the caller really receives, so measuring them would
+ *     overstate the savings.
  *
  * This measures the CODE-CONTEXT portion of tokens only — not a whole Claude
  * Code session (system prompt, conversation history, tool overhead all sit
- * on top and are unchanged by the daemon). Token counts use the same
- * ~4-chars/token estimate as the rest of the project.
+ * on top and are unchanged by the daemon). Token counts use the project's
+ * real BPE tokenizer (src/tokens.ts), the same figure trackSearch logs.
  *
  * Run:  node demo/measure-savings.mjs [/path/to/repo]
  */
@@ -43,8 +49,9 @@ console.log('Task-by-task (code-context tokens):\n');
 
 for (const task of tasks) {
   const results = await store.search(task, 5);
-  // WITH daemon: just the returned chunks.
-  const withTokens = estimateTokens(results.map((r) => r.code).join('\n\n'));
+  // WITH daemon: the ghost-file view the MCP tool actually returns to the
+  // caller — NOT the raw chunk bodies, which understate what's really sent.
+  const withTokens = estimateTokens(store.buildContext(results));
   // WITHOUT daemon: read the whole file(s) those chunks live in.
   const files = new Set(results.map((r) => r.filePath));
   let withoutTokens = 0;

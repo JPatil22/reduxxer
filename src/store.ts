@@ -31,6 +31,7 @@ interface IndexSnapshot {
   searchLog?: SearchLogEntry[];
   totalNaiveTokens?: number;
   totalTargetedTokens?: number;
+  totalCalls?: number;
 }
 
 const SEARCH_LOG_LIMIT = 200;
@@ -66,16 +67,26 @@ export class IndexStore {
   private searchLog: SearchLogEntry[] = [];
   private totalNaiveTokens = 0;
   private totalTargetedTokens = 0;
+  // True lifetime call count. searchLog is capped (recent view only), so its
+  // length can't be used as the call count once past the cap — the token
+  // totals below accumulate over ALL calls, so this must too, or the reported
+  // `calls` would disagree with the totals it's meant to summarize.
+  private totalCalls = 0;
   // Actual time the index last changed — not "now" on every stats() call.
   private lastUpdatedAt = new Date().toISOString();
 
-  // BM25 corpus statistics, rebuilt lazily when the index changes. Per-chunk
-  // term frequencies + lengths, per-term document frequency, and the average
-  // document length — everything BM25 needs to weight rare terms higher and
-  // saturate repeated ones, instead of the old raw keyword count.
+  // BM25 corpus statistics, maintained INCREMENTALLY as files are upserted and
+  // removed — not rebuilt from scratch on every edit. `bm25Docs` holds per-chunk
+  // term frequencies + length; `bm25Postings` is an INVERTED INDEX (term ->
+  // (chunkId -> tf)) so a query scores only the chunks that actually contain a
+  // query term, instead of scanning every chunk (per-term doc frequency is just
+  // that term's posting-list size). `bm25TotalLen` gives avgdl = total /
+  // doc-count. A full rebuild only happens once after a bulk load (bm25Dirty),
+  // so a single file save costs O(that file), not O(whole corpus).
   private bm25Docs = new Map<string, { tf: Map<string, number>; len: number }>();
-  private bm25Df = new Map<string, number>();
+  private bm25Postings = new Map<string, Map<string, number>>();
   private bm25Avgdl = 1;
+  private bm25TotalLen = 0;
   private bm25Dirty = true;
 
   // Approximate nearest-neighbor index (usearch/HNSW), built only once the
@@ -107,17 +118,27 @@ export class IndexStore {
       for (const id of old.chunkIds) {
         this.chunks.delete(id);
         this.annIndex?.remove(id);
+        if (!this.bm25Dirty) this.removeChunkFromBm25(id);
       }
     }
     const chunkIds: string[] = [];
+    const seenIds = new Set<string>();
     for (const chunk of chunks) {
+      // Defensive: an indexer should never hand us two chunks with the same id
+      // (see assignUniqueIds in indexer.ts), but if it ever regresses, don't
+      // list a duplicate in chunkIds — buildContext would render the survivor
+      // twice — or double-add it to the ANN index.
+      if (seenIds.has(chunk.id)) continue;
+      seenIds.add(chunk.id);
       this.chunks.set(chunk.id, chunk);
       chunkIds.push(chunk.id);
       if (this.annIndex && chunk.embedding) this.annIndex.add(chunk.id, chunk.embedding);
+      // Keep BM25 stats current for just this file's chunks. Skipped while a
+      // full rebuild is pending (bm25Dirty) — that rebuild will include them.
+      if (!this.bm25Dirty) this.addChunkToBm25(chunk);
     }
     this.files.set(filePath, { filePath, hash, chunkIds, tokens: estimateTokens(content) });
     this.lastUpdatedAt = new Date().toISOString();
-    this.bm25Dirty = true;
     this.maybeInitAnn();
   }
 
@@ -127,10 +148,10 @@ export class IndexStore {
       for (const id of old.chunkIds) {
         this.chunks.delete(id);
         this.annIndex?.remove(id);
+        if (!this.bm25Dirty) this.removeChunkFromBm25(id);
       }
       this.files.delete(filePath);
       this.lastUpdatedAt = new Date().toISOString();
-      this.bm25Dirty = true;
     }
   }
 
@@ -199,41 +220,90 @@ export class IndexStore {
       .map((t) => stemmer(t));
   }
 
-  /** Rebuilds BM25 corpus statistics from the current chunks. Lazy: only
-   *  runs when the index has changed since the last search. */
+  /** Full rebuild of BM25 corpus stats from scratch. Runs once after a bulk
+   *  load/initial index (bm25Dirty); individual edits are kept current by
+   *  addChunkToBm25/removeChunkFromBm25, so this is NOT paid per file change. */
   private rebuildBm25(): void {
     this.bm25Docs.clear();
-    this.bm25Df.clear();
-    let totalLen = 0;
-    for (const chunk of this.chunks.values()) {
-      const tokens = this.tokenize(`${chunk.symbolName} ${chunk.code}`);
-      const tf = new Map<string, number>();
-      for (const t of tokens) tf.set(t, (tf.get(t) ?? 0) + 1);
-      this.bm25Docs.set(chunk.id, { tf, len: tokens.length });
-      totalLen += tokens.length;
-      for (const term of tf.keys()) this.bm25Df.set(term, (this.bm25Df.get(term) ?? 0) + 1);
-    }
-    this.bm25Avgdl = this.bm25Docs.size > 0 ? totalLen / this.bm25Docs.size : 1;
+    this.bm25Postings.clear();
+    this.bm25TotalLen = 0;
+    for (const chunk of this.chunks.values()) this.addChunkToBm25(chunk);
     this.bm25Dirty = false;
   }
 
-  /** BM25 relevance score of one chunk for the given query tokens. Rare query
-   *  terms (low document frequency) count for more; repeated terms saturate;
-   *  long documents are length-normalized. Returns 0 for no term overlap. */
-  private bm25Score(queryTokens: string[], chunkId: string): number {
+  /** Fold one chunk into the BM25 stats: per-chunk tf/len, the running total
+   *  length, and one posting per distinct term in the inverted index. */
+  private addChunkToBm25(chunk: CodeChunk): void {
+    const tokens = this.tokenize(`${chunk.symbolName} ${chunk.code}`);
+    const tf = new Map<string, number>();
+    for (const t of tokens) tf.set(t, (tf.get(t) ?? 0) + 1);
+    this.bm25Docs.set(chunk.id, { tf, len: tokens.length });
+    this.bm25TotalLen += tokens.length;
+    for (const [term, count] of tf) {
+      let postings = this.bm25Postings.get(term);
+      if (!postings) {
+        postings = new Map();
+        this.bm25Postings.set(term, postings);
+      }
+      postings.set(chunk.id, count);
+    }
+  }
+
+  /** Remove one chunk's contribution from the BM25 stats. Exact inverse of
+   *  addChunkToBm25 — drops its postings (and any term whose posting list is now
+   *  empty) and its length, without a full re-tokenize of the whole corpus. */
+  private removeChunkFromBm25(chunkId: string): void {
     const doc = this.bm25Docs.get(chunkId);
-    if (!doc) return 0;
+    if (!doc) return;
+    this.bm25Docs.delete(chunkId);
+    this.bm25TotalLen -= doc.len;
+    for (const term of doc.tf.keys()) {
+      const postings = this.bm25Postings.get(term);
+      if (!postings) continue;
+      postings.delete(chunkId);
+      if (postings.size === 0) this.bm25Postings.delete(term);
+    }
+  }
+
+  /** Ensures BM25 stats are current before a search: a full rebuild only if
+   *  flagged dirty (after a bulk load), otherwise the incrementally-maintained
+   *  stats are already correct. Always refreshes avgdl from the running totals. */
+  private ensureBm25Current(): void {
+    if (this.bm25Dirty) this.rebuildBm25();
+    this.bm25Avgdl = this.bm25Docs.size > 0 ? this.bm25TotalLen / this.bm25Docs.size : 1;
+  }
+
+  /** Test-only: force a from-scratch recompute, so a test can assert the
+   *  incrementally-maintained stats match a full rebuild exactly. */
+  rebuildBm25ForTests(): void {
+    this.bm25Dirty = true;
+    this.ensureBm25Current();
+  }
+
+  /** BM25 scores for a query, computed through the inverted index: walk only
+   *  the posting lists of the query terms, so only chunks that actually contain
+   *  a query term are ever touched — not the whole corpus. Returns a map of
+   *  chunkId -> score (absent = 0). Identical arithmetic to scoring each chunk
+   *  individually; the double sum is just reordered term-major, so rankings are
+   *  unchanged. Rare query terms (small posting list) count for more; repeated
+   *  term frequencies saturate; long documents are length-normalized. */
+  private bm25ScoresForQuery(queryTokens: string[]): Map<string, number> {
+    const scores = new Map<string, number>();
     const n = this.bm25Docs.size;
     const { BM25_K1: k1, BM25_B: b } = IndexStore;
-    let score = 0;
     for (const term of queryTokens) {
-      const f = doc.tf.get(term);
-      if (!f) continue;
-      const df = this.bm25Df.get(term) ?? 0;
+      const postings = this.bm25Postings.get(term);
+      if (!postings) continue;
+      const df = postings.size; // documents containing this term
       const idf = Math.log(1 + (n - df + 0.5) / (df + 0.5));
-      score += idf * ((f * (k1 + 1)) / (f + k1 * (1 - b + (b * doc.len) / this.bm25Avgdl)));
+      for (const [chunkId, f] of postings) {
+        const doc = this.bm25Docs.get(chunkId);
+        if (!doc) continue;
+        const contribution = idf * ((f * (k1 + 1)) / (f + k1 * (1 - b + (b * doc.len) / this.bm25Avgdl)));
+        scores.set(chunkId, (scores.get(chunkId) ?? 0) + contribution);
+      }
     }
-    return score;
+    return scores;
   }
 
   /**
@@ -250,16 +320,13 @@ export class IndexStore {
    */
   async search(query: string, limit = 5): Promise<CodeChunk[]> {
     // Concurrency safety: embed the query FIRST (the only slow, suspending
-    // step) and take the index snapshot AFTER it. A file-watch or reconcile
-    // mutation can only land during an `await`; by snapshotting after the sole
-    // await and keeping everything below synchronous, this search always reads
-    // one consistent index state and no mutation can interleave mid-ranking.
-    // (Mutations — upsertFile/removeFile — are synchronous, so they apply
-    // atomically between, never during, a search's synchronous section.)
+    // step); everything after the sole `await` is synchronous. A file-watch or
+    // reconcile mutation (upsertFile/removeFile are synchronous) can only land
+    // BEFORE the ranking begins, never interleave mid-ranking — so ranking
+    // reads one consistent index state directly from `this.chunks`.
     const queryEmbedding = this.hasAnyEmbedding() ? await embedText(query) : null;
-    if (this.bm25Dirty) this.rebuildBm25();
-    const chunks = this.allChunks();
-    return this.searchWithEmbedding(query, queryEmbedding, limit, chunks);
+    this.ensureBm25Current();
+    return this.searchWithEmbedding(query, queryEmbedding, limit);
   }
 
   /** Cheap "does the index hold any embedded chunk" check, used to decide
@@ -276,8 +343,8 @@ export class IndexStore {
    * to verify actual ranking behavior, not just "it doesn't crash".
    */
   async searchByEmbeddingForTests(embedding: number[], limit = 5): Promise<CodeChunk[]> {
-    if (this.bm25Dirty) this.rebuildBm25();
-    return this.searchWithEmbedding('', embedding, limit, this.allChunks());
+    this.ensureBm25Current();
+    return this.searchWithEmbedding('', embedding, limit);
   }
 
   /**
@@ -293,31 +360,47 @@ export class IndexStore {
    * exceeds the budget (better to answer with the best chunk than nothing).
    */
   async searchWithinBudget(query: string, tokenBudget: number, maxPrimary = 25): Promise<CodeChunk[]> {
-    // Same snapshot-after-embedding discipline as search(): a consistent index
-    // read even if a mutation lands during the embedding await, and the greedy
-    // assembly below is fully synchronous so nothing can mutate mid-fill.
+    // Same discipline as search(): the only await is the embedding; everything
+    // after it (ranking + the greedy assembly below) is synchronous, so it reads
+    // one consistent index state and nothing can mutate mid-fill.
     const queryEmbedding = this.hasAnyEmbedding() ? await embedText(query) : null;
-    if (this.bm25Dirty) this.rebuildBm25();
-    const chunks = this.allChunks();
-    const ranked = this.rankChunks(query, queryEmbedding, maxPrimary, chunks);
+    this.ensureBm25Current();
+    const ranked = this.rankChunks(query, queryEmbedding, maxPrimary);
     if (ranked.length === 0) return [];
 
     const selected: CodeChunk[] = [];
     const selectedIds = new Set<string>();
+    // Incremental budget accounting: adding a chunk only affects its OWN file's
+    // ghost block, so we cache each touched file's rendered-block token count
+    // and re-render/re-encode just that one file on each add — instead of
+    // rebuilding and BPE-encoding the entire ghost view every time (which made
+    // this O(n^2) in the number of selected chunks). The budget is measured as
+    // the sum of per-file block token counts, a safe (slightly conservative)
+    // upper bound on the joined ghost view the caller ultimately receives.
+    const relevantByFile = new Map<string, Set<string>>();
+    const fileTokens = new Map<string, number>();
+    let totalTokens = 0;
 
-    // Add a chunk and keep it only if the newly-rendered context still fits
-    // the budget. The very first chunk is always kept so a big top match never
+    // Add a chunk and keep it only if the resulting context still fits the
+    // budget. The very first chunk is always kept so a big top match never
     // yields an empty result. Returns whether the chunk was kept.
     const tryAdd = (c: CodeChunk): boolean => {
       if (selectedIds.has(c.id)) return false;
-      selected.push(c);
-      selectedIds.add(c.id);
-      const overBudget = estimateTokens(this.buildContext(selected)) > tokenBudget;
-      if (overBudget && selected.length > 1) {
-        selected.pop();
-        selectedIds.delete(c.id);
+      const fp = c.filePath;
+      const relevant = relevantByFile.get(fp) ?? new Set<string>();
+      const prevBlockTokens = fileTokens.get(fp) ?? 0;
+      relevant.add(c.id);
+      const newBlockTokens = estimateTokens(this.renderFileBlock(fp, relevant));
+      const newTotal = totalTokens - prevBlockTokens + newBlockTokens;
+      if (newTotal > tokenBudget && selected.length >= 1) {
+        relevant.delete(c.id); // revert; a smaller later match may still fit
         return false;
       }
+      relevantByFile.set(fp, relevant);
+      fileTokens.set(fp, newBlockTokens);
+      totalTokens = newTotal;
+      selected.push(c);
+      selectedIds.add(c.id);
       return true;
     };
 
@@ -345,47 +428,49 @@ export class IndexStore {
    *  the relevance gate, and returns the top `limit` matches — WITHOUT any
    *  dependency expansion. Both the fixed-cap and budget-based assembly paths
    *  build on top of this. */
-  private rankChunks(
-    query: string,
-    queryEmbedding: number[] | null,
-    limit: number,
-    chunks: CodeChunk[]
-  ): CodeChunk[] {
+  private rankChunks(query: string, queryEmbedding: number[] | null, limit: number): CodeChunk[] {
     const normalizedQuery = query.toLowerCase().trim();
     const terms = this.queryTerms(query);
     const queryTokens = this.tokenize(query);
 
+    // Lexical scores via the inverted index — only chunks that actually contain
+    // a query term are visited, not the whole corpus. BM25 scores are >= 0, so
+    // the max over these is also the max over ALL chunks (the rest are 0);
+    // normalize to [0,1] (top lexical hit = 1) before blending with semantic.
+    const bm25Scores = this.bm25ScoresForQuery(queryTokens);
+    let bm25Max = 0;
+    for (const s of bm25Scores.values()) if (s > bm25Max) bm25Max = s;
+
     // When the ANN index is active, pull a generous candidate set of
-    // semantically-close chunks from it instead of computing cosine
-    // similarity against every single chunk. Chunks outside this candidate
-    // set simply get semantic=0 (same as a chunk with no embedding at all)
-    // — they still fully qualify for results via an exact name match or
-    // real lexical (BM25) overlap, just without the semantic-floor boost.
-    // Requesting well more than `limit` candidates leaves room for BM25 and
-    // the relevance gate below to re-rank without losing the true best match.
+    // semantically-close chunks from it instead of computing cosine similarity
+    // against every chunk. Chunks outside this set get semantic=0.
     let annScores: Map<string, number> | null = null;
     if (this.annIndex && queryEmbedding) {
       const candidateK = Math.max(limit * 10, 50);
       annScores = new Map(this.annIndex.search(queryEmbedding, candidateK).map((r) => [r.chunkId, r.similarity]));
     }
 
-    // BM25 scores are unbounded and corpus-dependent, so normalize them to
-    // [0,1] within this query (top lexical hit = 1) before blending with the
-    // semantic score, which is already [0,1]. Reduced with a loop rather than
-    // Math.max(0, ...bm25Raw) — spreading a large array as call arguments
-    // hits V8's argument-count limit and crashes on big repos (verified: a
-    // 200,000-chunk corpus threw "Maximum call stack size exceeded" here).
-    const bm25Raw = chunks.map((c) => this.bm25Score(queryTokens, c.id));
-    let bm25Max = 0;
-    for (const s of bm25Raw) if (s > bm25Max) bm25Max = s;
+    // Semantic is brute-forced (every chunk scored) only when embeddings are on
+    // AND the corpus is below the ANN threshold — already fast at that size.
+    // Otherwise the candidate set is small: chunks with a query term (inverted
+    // index), the ANN's neighbors, or an exact name-substring hit.
+    const bruteSemantic = queryEmbedding !== null && !this.annIndex;
 
-    const scored = chunks.map((chunk, i) => {
-      // Normalized BM25, with a penalty for whole-file fallback chunks — a
-      // giant file stuffed with repeated terms shouldn't outrank the real
-      // function that answers, which BM25 length-normalization alone doesn't
-      // fully prevent.
+    // One pass in insertion order (so ties break identically to before, under a
+    // stable sort), but the expensive scoring/gate math runs ONLY for
+    // candidates — non-candidates are skipped without touching BM25/vector math.
+    const scored: Array<{ chunk: CodeChunk; score: number }> = [];
+    for (const chunk of this.chunks.values()) {
+      const bm = bm25Scores.get(chunk.id);
+      const inAnn = annScores !== null && annScores.has(chunk.id);
+      const nameHit = normalizedQuery.length > 0 && chunk.symbolName.toLowerCase().includes(normalizedQuery);
+      if (bm === undefined && !inAnn && !nameHit && !bruteSemantic) continue; // not a candidate
+
+      // Normalized BM25, with a penalty for whole-file fallback chunks — a giant
+      // file stuffed with repeated terms shouldn't outrank the real function
+      // that answers, which BM25 length-normalization alone doesn't fully prevent.
       const kindPenalty = chunk.kind === 'file' ? 0.3 : 1;
-      const lexical = (bm25Max > 0 ? bm25Raw[i] / bm25Max : 0) * kindPenalty;
+      const lexical = (bm25Max > 0 ? (bm ?? 0) / bm25Max : 0) * kindPenalty;
       const semantic = annScores
         ? (annScores.get(chunk.id) ?? 0)
         : queryEmbedding && chunk.embedding
@@ -398,25 +483,19 @@ export class IndexStore {
       // Relevance gate — a chunk counts as a real match if ANY of:
       //  - the whole query is a substring of the symbol name (exact lookup);
       //  - it clears the semantic floor (strong meaning match);
-      //  - it contains at least two distinct query content-words (real
-      //    lexical overlap concentrated in one chunk, which rescues genuine
-      //    matches that score low semantically in tiny repos).
+      //  - it contains at least two distinct query content-words (real lexical
+      //    overlap concentrated in one chunk).
       // A query for functionality that doesn't exist shares at most one
-      // incidental word and has low similarity, so it clears none of these
-      // and returns nothing instead of the nearest wrong chunk. Checked
-      // against the same stemmed token set BM25 scores on (exact token
-      // membership, not a raw substring scan — avoids false positives like
-      // "art" matching inside "start").
+      // incidental word and has low similarity, so it clears none of these and
+      // contributes nothing rather than the nearest wrong chunk.
       const doc = this.bm25Docs.get(chunk.id);
       const distinctTerms = doc ? terms.filter((t) => doc.tf.has(t)).length : 0;
-      const nameHit = normalizedQuery.length > 0 && chunk.symbolName.toLowerCase().includes(normalizedQuery);
       const relevant =
         nameHit || (queryEmbedding !== null && semantic >= IndexStore.SEMANTIC_FLOOR) || distinctTerms >= 2;
-      return { chunk, score, relevant };
-    });
+      if (relevant) scored.push({ chunk, score });
+    }
 
     return scored
-      .filter((s) => s.relevant)
       .sort((a, b) => b.score - a.score)
       .slice(0, limit)
       .map((s) => s.chunk);
@@ -427,10 +506,9 @@ export class IndexStore {
   private searchWithEmbedding(
     query: string,
     queryEmbedding: number[] | null,
-    limit: number,
-    chunks: CodeChunk[]
+    limit: number
   ): CodeChunk[] {
-    return this.expandWithReferences(this.rankChunks(query, queryEmbedding, limit, chunks));
+    return this.expandWithReferences(this.rankChunks(query, queryEmbedding, limit));
   }
 
   // Minimum cosine similarity for a chunk to count as a semantic match. A
@@ -558,44 +636,48 @@ export class IndexStore {
       relevantByFile.get(r.filePath)!.add(r.id);
     }
 
-    const blocks: string[] = [];
-    for (const filePath of fileOrder) {
-      const relevant = relevantByFile.get(filePath)!;
-      const record = this.files.get(filePath);
-      const fileChunks = (record?.chunkIds ?? [...relevant])
-        .map((id) => this.chunks.get(id))
-        .filter((c): c is CodeChunk => c !== undefined)
-        .sort((a, b) => a.startLine - b.startLine || a.endLine - b.endLine);
+    return fileOrder.map((fp) => this.renderFileBlock(fp, relevantByFile.get(fp)!)).join('\n\n');
+  }
 
-      const out: string[] = [`// ═══ ${filePath} ═══`];
-      const header = fileChunks.find((c) => c.kind === 'module');
-      if (header) out.push(header.code);
+  /** Renders ONE file's ghost-file block given the set of its chunk ids that
+   *  count as matched (expanded in full); every other symbol in the file is
+   *  collapsed to a one-line signature. Extracted from buildContext so the
+   *  budget-based assembly can re-render a single changed file's block
+   *  incrementally instead of rebuilding the whole ghost view each step. */
+  private renderFileBlock(filePath: string, relevant: Set<string>): string {
+    const record = this.files.get(filePath);
+    const fileChunks = (record?.chunkIds ?? [...relevant])
+      .map((id) => this.chunks.get(id))
+      .filter((c): c is CodeChunk => c !== undefined)
+      .sort((a, b) => a.startLine - b.startLine || a.endLine - b.endLine);
 
-      let collapsedShown = 0;
-      let collapsedTotal = 0;
-      for (const chunk of fileChunks) {
-        if (chunk.kind === 'module') continue;
-        if (chunk.symbolName === '__file__') {
-          if (relevant.has(chunk.id)) out.push(chunk.code);
-          continue;
-        }
-        if (relevant.has(chunk.id)) {
-          out.push(`// ▸ ${chunk.symbolName}  (${chunk.kind}, lines ${chunk.startLine}-${chunk.endLine})`);
-          out.push(chunk.code);
-        } else {
-          collapsedTotal++;
-          if (collapsedShown >= IndexStore.MAX_COLLAPSED_PER_FILE) continue;
-          const signature = chunk.code.split('\n')[0].trim();
-          out.push(`//   ${chunk.symbolName}  (${chunk.kind}, lines ${chunk.startLine}-${chunk.endLine}):  ${signature}`);
-          collapsedShown++;
-        }
+    const out: string[] = [`// ═══ ${filePath} ═══`];
+    const header = fileChunks.find((c) => c.kind === 'module');
+    if (header) out.push(header.code);
+
+    let collapsedShown = 0;
+    let collapsedTotal = 0;
+    for (const chunk of fileChunks) {
+      if (chunk.kind === 'module') continue;
+      if (chunk.symbolName === '__file__') {
+        if (relevant.has(chunk.id)) out.push(chunk.code);
+        continue;
       }
-      if (collapsedTotal > collapsedShown) {
-        out.push(`//   … ${collapsedTotal - collapsedShown} more symbol(s) in this file`);
+      if (relevant.has(chunk.id)) {
+        out.push(`// ▸ ${chunk.symbolName}  (${chunk.kind}, lines ${chunk.startLine}-${chunk.endLine})`);
+        out.push(chunk.code);
+      } else {
+        collapsedTotal++;
+        if (collapsedShown >= IndexStore.MAX_COLLAPSED_PER_FILE) continue;
+        const signature = chunk.code.split('\n')[0].trim();
+        out.push(`//   ${chunk.symbolName}  (${chunk.kind}, lines ${chunk.startLine}-${chunk.endLine}):  ${signature}`);
+        collapsedShown++;
       }
-      blocks.push(out.join('\n'));
     }
-    return blocks.join('\n\n');
+    if (collapsedTotal > collapsedShown) {
+      out.push(`//   … ${collapsedTotal - collapsedShown} more symbol(s) in this file`);
+    }
+    return out.join('\n');
   }
 
   stats() {
@@ -633,16 +715,24 @@ export class IndexStore {
     if (this.searchLog.length > SEARCH_LOG_LIMIT) this.searchLog.shift();
     this.totalNaiveTokens += naiveTokens;
     this.totalTargetedTokens += targetedTokens;
+    this.totalCalls += 1;
 
     return entry;
   }
 
+  /**
+   * Cumulative token savings across ALL search_context calls (persisted across
+   * restarts), vs the naive baseline of reading the whole file(s) each call
+   * would otherwise have pulled in. This is a PER-CALL cumulative sum: a file
+   * read by K calls counts K times, because without the daemon each of those
+   * calls would have read it whole — it is not a count of unique tokens.
+   */
   tokenSavings() {
     const totalSaved = Math.max(0, this.totalNaiveTokens - this.totalTargetedTokens);
     const reductionPct =
       this.totalNaiveTokens === 0 ? 0 : Math.round((totalSaved / this.totalNaiveTokens) * 100);
     return {
-      calls: this.searchLog.length,
+      calls: this.totalCalls,
       totalNaiveTokens: this.totalNaiveTokens,
       totalTargetedTokens: this.totalTargetedTokens,
       totalSavedTokens: totalSaved,
@@ -667,6 +757,7 @@ export class IndexStore {
       searchLog: this.searchLog,
       totalNaiveTokens: this.totalNaiveTokens,
       totalTargetedTokens: this.totalTargetedTokens,
+      totalCalls: this.totalCalls,
     };
     await fs.promises.mkdir(path.dirname(snapshotPath), { recursive: true });
     const tmpPath = `${snapshotPath}.tmp`;
@@ -706,6 +797,12 @@ export class IndexStore {
       this.files.clear();
       this.chunks.clear();
       this.annIndex = null;
+      // Reset BM25 stats and flag a rebuild — they're recomputed lazily from
+      // the loaded chunks on the first search (not maintained during load).
+      this.bm25Docs.clear();
+      this.bm25Postings.clear();
+      this.bm25TotalLen = 0;
+      this.bm25Dirty = true;
       for (const file of snapshot.files) this.files.set(file.filePath, file);
       for (const chunk of snapshot.chunks) {
         const c = deserializeChunk(chunk);
@@ -719,6 +816,9 @@ export class IndexStore {
       this.searchLog = snapshot.searchLog ?? [];
       this.totalNaiveTokens = snapshot.totalNaiveTokens ?? 0;
       this.totalTargetedTokens = snapshot.totalTargetedTokens ?? 0;
+      // Older snapshots predate the lifetime call counter — fall back to the
+      // (capped) log length so the number is at least non-zero, not exact.
+      this.totalCalls = snapshot.totalCalls ?? this.searchLog.length;
 
       // Try to restore a persisted ANN index instead of paying the full
       // build cost again on every restart. If it's missing, stale (chunk

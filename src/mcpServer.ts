@@ -5,6 +5,17 @@ import { z } from 'zod';
 import { IndexStore } from './store.js';
 import { SearchLogEntry } from './types.js';
 
+// Input bounds for the search_context tool — a client (or a prompt-injected
+// one) must not be able to drive unbounded work through it.
+const MAX_QUERY_LEN = 2000; // chars; a real natural-language query is far shorter
+const MAX_LIMIT = 50; // chunks
+const MAX_TOKEN_BUDGET = 200_000; // feeds the greedy budget assembly
+
+/** Clamp to [lo, hi]; a non-finite input (NaN/Infinity from a hostile client)
+ *  falls back to the low bound rather than passing through. Exported for tests. */
+export const clamp = (n: number, lo: number, hi: number): number =>
+  Number.isFinite(n) ? Math.min(Math.max(n, lo), hi) : lo;
+
 /**
  * Append one line per search_context call to an audit log, tagged with the
  * name of the MCP client that made the call (e.g. "Cursor", "claude-code").
@@ -74,9 +85,13 @@ export function createMcpServer(store: IndexStore, logPath?: string) {
         ),
     },
     async ({ query, limit, token_budget }: { query: string; limit?: number; token_budget?: number }) => {
+      // Clamp all inputs: a client (or a prompt-injected one) shouldn't be able
+      // to drive unbounded work via a giant query, a huge limit, or a
+      // pathological token_budget (which feeds the greedy budget assembly).
+      const q = (typeof query === 'string' ? query : '').slice(0, MAX_QUERY_LEN);
       const results = token_budget
-        ? await store.searchWithinBudget(query, token_budget)
-        : await store.search(query, limit ?? 5);
+        ? await store.searchWithinBudget(q, clamp(token_budget, 1, MAX_TOKEN_BUDGET))
+        : await store.search(q, clamp(Math.floor(limit ?? 5), 1, MAX_LIMIT));
       if (results.length === 0) {
         return {
           content: [
@@ -90,10 +105,10 @@ export function createMcpServer(store: IndexStore, logPath?: string) {
       // Render as a ghost-file view (imports + matched code + collapsed
       // sibling signatures) so the caller has the structure to edit safely.
       const ghost = store.buildContext(results);
-      const logEntry = store.trackSearch(query, results, ghost);
+      const logEntry = store.trackSearch(q, results, ghost);
       if (logPath) {
         const client = server.server.getClientVersion();
-        appendRequestLog(logPath, client?.name ?? 'unknown', query, logEntry);
+        appendRequestLog(logPath, client?.name ?? 'unknown', q, logEntry);
       }
       const text =
         ghost +
@@ -115,7 +130,7 @@ export function createMcpServer(store: IndexStore, logPath?: string) {
 
   server.tool(
     'get_token_savings',
-    'Get cumulative estimated token savings from search_context calls this session, vs the naive baseline of reading whole files.',
+    'Get cumulative estimated token savings across ALL search_context calls (persisted across daemon restarts, not just this session), vs the naive baseline of reading the whole file(s) each call would otherwise have pulled in. This is a per-call cumulative sum, not a count of unique tokens.',
     {},
     async () => {
       return { content: [{ type: 'text' as const, text: JSON.stringify(store.tokenSavings(), null, 2) }] };

@@ -130,7 +130,12 @@ export function parseFile(filePath: string, content: string, repoRoot?: string):
   const lines = codeToParse.split('\n');
   // Names this chunk calls (e.g. `validateCard(...)`), resolved against
   // other chunks in this same file once every chunk has been collected.
-  const calledNamesByChunkId = new Map<string, Set<string>>();
+  // Keyed by the chunk OBJECT, not its id: ids are made unique in a later
+  // pass (overload merge + collision suffixing), so an id captured now could
+  // go stale — object identity never does.
+  const calledNamesByChunk = new Map<CodeChunk, Set<string>>();
+  // Function-declaration overload bookkeeping (see mergeFunctionOverloads).
+  const fnDecls: Array<{ chunk: CodeChunk; parentPos: number; name: string; hasBody: boolean }> = [];
 
   function getLineRange(node: ts.Node): { start: number; end: number } {
     const start = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile)).line + 1 + lineOffset;
@@ -152,15 +157,13 @@ export function parseFile(filePath: string, content: string, repoRoot?: string):
     return names;
   }
 
-  function addChunk(name: string, kind: string, node: ts.Node) {
+  function addChunk(name: string, kind: string, node: ts.Node): CodeChunk {
     const { start, end } = getLineRange(node);
     // start/end are absolute file line numbers (offset applied); `lines` is
     // relative to the parsed block, so slice using the un-offset range.
     const code = lines.slice(start - 1 - lineOffset, end - lineOffset).join('\n');
-    const id = `${filePath}::${name}`;
-    calledNamesByChunkId.set(id, collectCalledNames(node));
-    chunks.push({
-      id,
+    const chunk: CodeChunk = {
+      id: `${filePath}::${name}`, // provisional — made unique in assignUniqueIds()
       filePath,
       symbolName: name,
       kind,
@@ -168,7 +171,10 @@ export function parseFile(filePath: string, content: string, repoRoot?: string):
       endLine: end,
       code,
       fileHash,
-    });
+    };
+    calledNamesByChunk.set(chunk, collectCalledNames(node));
+    chunks.push(chunk);
+    return chunk;
   }
 
   function isFunctionLikeProperty(m: ts.ClassElement): boolean {
@@ -208,13 +214,22 @@ export function parseFile(filePath: string, content: string, repoRoot?: string):
       }
     }
 
-    const mods = node.modifiers?.map((m) => m.getText(sourceFile)).join(' ') ?? '';
+    // Decorators (@Component(...)) render on their own line(s) ABOVE the
+    // signature. In TS 5's AST they live inside node.modifiers, so folding all
+    // modifiers into one string would mash a multi-line decorator onto the
+    // signature line — split them out via the typed accessors instead.
+    const decoratorLines = (
+      (ts.canHaveDecorators(node) ? ts.getDecorators(node) : undefined) ?? []
+    ).map((d) => d.getText(sourceFile));
+    const mods = (ts.getModifiers(node) ?? []).map((m) => m.getText(sourceFile)).join(' ');
     const typeParams = node.typeParameters
       ? `<${node.typeParameters.map((t) => t.getText(sourceFile)).join(', ')}>`
       : '';
     const heritage = node.heritageClauses?.map((h) => h.getText(sourceFile)).join(' ') ?? '';
     const signature = `${mods ? mods + ' ' : ''}class ${className}${typeParams}${heritage ? ' ' + heritage : ''} {`;
-    const headerCode = [signature, ...fields.map((f) => '  ' + f.getText(sourceFile)), '}'].join('\n');
+    const headerCode = [...decoratorLines, signature, ...fields.map((f) => '  ' + f.getText(sourceFile)), '}'].join(
+      '\n'
+    );
 
     // The header's line range must cover only what its code actually shows —
     // the declaration line through the last field — not the whole class span,
@@ -222,10 +237,8 @@ export function parseFile(filePath: string, content: string, repoRoot?: string):
     const classStart = getLineRange(node).start;
     let headerEnd = classStart;
     for (const f of fields) headerEnd = Math.max(headerEnd, getLineRange(f).end);
-    const headerId = `${filePath}::${className}`;
-    calledNamesByChunkId.set(headerId, new Set());
-    chunks.push({
-      id: headerId,
+    const headerChunk: CodeChunk = {
+      id: `${filePath}::${className}`, // provisional — made unique in assignUniqueIds()
       filePath,
       symbolName: className,
       kind: 'class',
@@ -233,20 +246,87 @@ export function parseFile(filePath: string, content: string, repoRoot?: string):
       endLine: headerEnd,
       code: headerCode,
       fileHash,
-    });
+    };
+    calledNamesByChunk.set(headerChunk, new Set());
+    chunks.push(headerChunk);
 
     for (const member of methods) {
-      addChunk(`${className}.${memberName(member)}`, 'method', member);
+      // get/set accessor pairs share a member name; a distinct `kind` keeps the
+      // two chunks self-describing, and assignUniqueIds keeps their ids apart.
+      const kind = ts.isGetAccessorDeclaration(member)
+        ? 'getter'
+        : ts.isSetAccessorDeclaration(member)
+          ? 'setter'
+          : 'method';
+      addChunk(`${className}.${memberName(member)}`, kind, member);
     }
   }
 
-  function visit(node: ts.Node) {
-    if (ts.isFunctionDeclaration(node) && node.name) {
-      addChunk(node.name.text, 'function', node);
-    } else if (ts.isClassDeclaration(node) && node.name) {
-      addClassChunks(node, node.name.text);
+  /** A compact one-line header chunk for a namespace/module, so the namespace
+   *  name itself is findable (its members are indexed separately, qualified). */
+  function addNamespaceHeader(node: ts.ModuleDeclaration, qualifiedName: string): void {
+    const { start } = getLineRange(node);
+    const mods = (ts.getModifiers(node) ?? []).map((m) => m.getText(sourceFile)).join(' ');
+    const keyword = node.flags & ts.NodeFlags.Namespace ? 'namespace' : 'module';
+    const chunk: CodeChunk = {
+      id: `${filePath}::${qualifiedName}`, // provisional — made unique in assignUniqueIds()
+      filePath,
+      symbolName: qualifiedName,
+      kind: 'namespace',
+      startLine: start,
+      endLine: start,
+      code: `${mods ? mods + ' ' : ''}${keyword} ${qualifiedName} {`,
+      fileHash,
+    };
+    calledNamesByChunk.set(chunk, new Set());
+    chunks.push(chunk);
+  }
+
+  function visit(node: ts.Node, prefix = '') {
+    // namespace/module Foo { ... } — index the namespace itself and QUALIFY its
+    // members (Foo.bar), the way class methods are qualified, instead of
+    // flattening members to bare top-level names that collide across namespaces
+    // and lose the namespace they belong to. String-module (`declare module
+    // 'x'`) and `declare global` blocks fall through to the generic recursion.
+    if (ts.isModuleDeclaration(node) && node.name && ts.isIdentifier(node.name)) {
+      const qualified = prefix + node.name.text;
+      addNamespaceHeader(node, qualified);
+      if (node.body) {
+        if (ts.isModuleBlock(node.body)) {
+          for (const stmt of node.body.statements) visit(stmt, `${qualified}.`);
+        } else if (ts.isModuleDeclaration(node.body)) {
+          visit(node.body, `${qualified}.`); // dotted shorthand: `namespace A.B {}`
+        }
+      }
+      return; // handled the body ourselves — skip the generic recursion below
+    }
+
+    if (ts.isFunctionDeclaration(node)) {
+      // A nameless function declaration is only legal as `export default
+      // function() {}` — index it under a synthetic `default` name so its body
+      // is findable instead of invisible.
+      const name = prefix + (node.name?.text ?? 'default');
+      const chunk = addChunk(name, 'function', node);
+      // Bodyless declarations are overload signatures; the one with a body is
+      // the implementation. Grouped and merged after the walk.
+      fnDecls.push({ chunk, parentPos: node.parent.pos, name, hasBody: !!node.body });
+    } else if (ts.isClassDeclaration(node)) {
+      // Named, or anonymous `export default class {}`.
+      addClassChunks(node, prefix + (node.name?.text ?? 'default'));
     } else if (ts.isInterfaceDeclaration(node)) {
-      addChunk(node.name.text, 'interface', node);
+      addChunk(prefix + node.name.text, 'interface', node);
+    } else if (ts.isExportAssignment(node) && !node.isExportEquals && !ts.isIdentifier(node.expression)) {
+      // `export default <expr>` where expr isn't a bare identifier (a bare
+      // identifier just re-exports an already-indexed symbol). Captures
+      // anonymous default arrows/functions and HOC-wrapped components
+      // (`export default connect()(App)`), which were otherwise invisible.
+      const kind =
+        ts.isArrowFunction(node.expression) || ts.isFunctionExpression(node.expression)
+          ? 'const-function'
+          : ts.isClassExpression(node.expression)
+            ? 'class'
+            : 'value';
+      addChunk(prefix + 'default', kind, node);
     } else if (ts.isVariableStatement(node)) {
       for (const decl of node.declarationList.declarations) {
         if (
@@ -254,14 +334,73 @@ export function parseFile(filePath: string, content: string, repoRoot?: string):
           decl.initializer &&
           (ts.isArrowFunction(decl.initializer) || ts.isFunctionExpression(decl.initializer))
         ) {
-          addChunk(decl.name.text, 'const-function', node);
+          addChunk(prefix + decl.name.text, 'const-function', node);
         }
       }
     }
-    ts.forEachChild(node, visit);
+    ts.forEachChild(node, (child) => visit(child, prefix));
   }
 
   visit(sourceFile);
+
+  /**
+   * Collapse function-declaration overloads into one chunk. TS requires
+   * overload signatures (bodyless) to be contiguous and to immediately
+   * precede the implementation, all sharing a parent — so a group keyed by
+   * (parent, name) spans a clean, contiguous line range. Without this, three
+   * `foo` declarations produced three chunks with the SAME id, and all but
+   * one were silently dropped by the store.
+   */
+  function mergeFunctionOverloads(): void {
+    const groups = new Map<string, typeof fnDecls>();
+    for (const fd of fnDecls) {
+      const key = `${fd.parentPos}::${fd.name}`;
+      const g = groups.get(key);
+      if (g) g.push(fd);
+      else groups.set(key, [fd]);
+    }
+    for (const group of groups.values()) {
+      if (group.length < 2) continue;
+      // Representative: the implementation if present, else the last signature
+      // (ambient overloads that have no implementation body).
+      const rep = group.find((g) => g.hasBody) ?? group[group.length - 1];
+      let start = rep.chunk.startLine;
+      let end = rep.chunk.endLine;
+      for (const g of group) {
+        start = Math.min(start, g.chunk.startLine);
+        end = Math.max(end, g.chunk.endLine);
+      }
+      rep.chunk.startLine = start;
+      rep.chunk.endLine = end;
+      rep.chunk.code = lines.slice(start - 1 - lineOffset, end - lineOffset).join('\n');
+      for (const g of group) {
+        if (g.chunk === rep.chunk) continue;
+        const idx = chunks.indexOf(g.chunk);
+        if (idx >= 0) chunks.splice(idx, 1);
+        calledNamesByChunk.delete(g.chunk);
+      }
+    }
+  }
+
+  /**
+   * Guarantee every chunk id is unique within the file. Two symbols can
+   * legitimately share a name — declaration merging (an `interface Config`
+   * plus a `function Config`, a value plus a type), get/set accessor pairs,
+   * or any residual same-name symbols. The first occurrence keeps the bare
+   * `${file}::${name}` id (so cross-file import resolution still finds it);
+   * later ones are suffixed with `$n` so none is silently overwritten.
+   */
+  function assignUniqueIds(): void {
+    const counts = new Map<string, number>();
+    for (const chunk of chunks) {
+      const n = (counts.get(chunk.symbolName) ?? 0) + 1;
+      counts.set(chunk.symbolName, n);
+      chunk.id = n === 1 ? `${filePath}::${chunk.symbolName}` : `${filePath}::${chunk.symbolName}$${n}`;
+    }
+  }
+
+  mergeFunctionOverloads();
+  assignUniqueIds();
 
   // Map each locally-bound imported name to the target file (resolved,
   // without extension) and the original exported name. Relative imports
@@ -306,7 +445,7 @@ export function parseFile(filePath: string, content: string, repoRoot?: string):
   // resolved to actual chunk ids by the store at search time.
   const nameToId = new Map(chunks.map((c) => [c.symbolName, c.id]));
   for (const chunk of chunks) {
-    const calledNames = calledNamesByChunkId.get(chunk.id);
+    const calledNames = calledNamesByChunk.get(chunk);
     if (!calledNames) continue;
     const references: string[] = [];
     const externalRefs: string[] = [];

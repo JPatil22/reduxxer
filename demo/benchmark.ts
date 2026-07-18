@@ -25,7 +25,11 @@ async function main() {
   const store = new IndexStore();
   await indexRepo(store, fixtureRepo);
   const results = await store.search(query, 3);
-  const smartText = results.map((r) => r.code).join('\n\n');
+  // Measure the ghost-file view the MCP tool actually returns to the caller
+  // (buildContext), not the raw chunk bodies (`results.map(r => r.code)`) —
+  // the raw bodies are smaller than what's really sent, so measuring them
+  // would overstate the reduction.
+  const smartText = store.buildContext(results);
   const smartTokens = estimateTokens(smartText);
 
   const fileCount = fs.readdirSync(fixtureRepo).filter((f) => f.endsWith('.ts')).length;

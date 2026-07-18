@@ -51,9 +51,30 @@ function resolveInterpreter(): Promise<string | null> {
   return interpreterPromise;
 }
 
+// A single parse round-trip should take milliseconds (files are already size-
+// capped before they reach here). This bound exists only so a wedged/hung
+// worker can't leave a parse() awaiting forever and — via pLimit(8) upstream —
+// stall ALL Python indexing. On timeout the worker is killed and respawned.
+let parseTimeoutMs = 15000;
+
+/** Test-only: shrink the per-parse timeout so the timeout+restart path can be
+ *  exercised deterministically without a genuinely hung interpreter. */
+export function setPythonParseTimeoutForTests(ms: number): void {
+  parseTimeoutMs = ms;
+}
+
+interface PendingRequest {
+  resolve: (val: any) => void;
+  reject: (err: any) => void;
+  timer: NodeJS.Timeout;
+}
+
 class PythonWorker {
   private proc: ChildProcess | null = null;
-  private queue: Array<{ resolve: (val: any) => void; reject: (err: any) => void }> = [];
+  // Correlated by request id, NOT arrival order — one malformed or dropped
+  // line can no longer desync every subsequent response.
+  private pending = new Map<number, PendingRequest>();
+  private nextId = 1;
   private startPromise: Promise<boolean> | null = null;
 
   async start(): Promise<boolean> {
@@ -61,74 +82,100 @@ class PythonWorker {
     this.startPromise = (async () => {
       const interp = await resolveInterpreter();
       if (!interp) return false;
-      
       try {
-        this.proc = spawn(interp, ['-u', PARSE_SCRIPT, '--worker']);
-        this.proc.on('error', (err) => {
-          this.handleCrash(err);
-        });
-        this.proc.on('exit', (code) => {
-          this.handleCrash(new Error(`Python process exited with code ${code}`));
-        });
-        
-        // Suppress stderr noise but allow printing errors
-        this.proc.stderr!.on('data', (d) => {
+        const proc = spawn(interp, ['-u', PARSE_SCRIPT, '--worker']);
+        this.proc = proc;
+
+        // Death handlers capture THIS proc and no-op if a newer worker has
+        // since replaced it, so a dying old worker's exit event can't tear
+        // down a freshly-spawned one (the classic stale-handler race).
+        const onDead = (err: Error) => {
+          if (this.proc !== proc) return;
+          this.proc = null;
+          this.startPromise = null;
+          this.rejectAllPending(err);
+        };
+        proc.on('error', onDead);
+        proc.on('exit', (code) => onDead(new Error(`Python worker exited with code ${code}`)));
+        proc.stdin!.on('error', () => {}); // ignore EPIPE if the child exits mid-write
+        proc.stderr!.on('data', (d) => {
           console.error(`context-daemon: python worker stderr: ${d.toString().trim()}`);
         });
 
-        const rl = readline.createInterface({
-          input: this.proc.stdout!,
-          terminal: false
-        });
-        
-        rl.on('line', (line) => {
-          const next = this.queue.shift();
-          if (!next) return;
-          try {
-            const parsed = JSON.parse(line);
-            next.resolve(parsed);
-          } catch (e) {
-            next.reject(e);
-          }
-        });
-        
+        readline
+          .createInterface({ input: proc.stdout!, terminal: false })
+          .on('line', (line) => this.handleLine(line));
+
         return true;
       } catch (err) {
         console.error('context-daemon: failed to start Python worker:', err);
+        this.proc = null;
+        this.startPromise = null;
         return false;
       }
     })();
     return this.startPromise;
   }
 
-  private handleCrash(err: Error) {
-    const oldQueue = this.queue;
-    this.queue = [];
-    for (const item of oldQueue) {
-      item.reject(err);
+  private handleLine(line: string): void {
+    let resp: any;
+    try {
+      resp = JSON.parse(line);
+    } catch {
+      return; // stray/non-protocol stdout line — ignore, don't desync others
     }
-    this.proc = null;
-    this.startPromise = null;
+    const id = resp?.id;
+    const entry = typeof id === 'number' ? this.pending.get(id) : undefined;
+    if (!entry) return; // unknown id, or one that already timed out
+    clearTimeout(entry.timer);
+    this.pending.delete(id);
+    entry.resolve(resp);
   }
 
-  close() {
-    if (this.proc) {
-      this.proc.kill();
-      this.proc = null;
+  private rejectAllPending(err: Error): void {
+    const pending = this.pending;
+    this.pending = new Map();
+    for (const entry of pending.values()) {
+      clearTimeout(entry.timer);
+      entry.reject(err);
     }
+  }
+
+  close(): void {
+    const proc = this.proc;
+    this.proc = null;
     this.startPromise = null;
-    this.queue = [];
+    this.rejectAllPending(new Error('Python worker closed'));
+    if (proc) proc.kill();
   }
 
   async parse(content: string): Promise<any> {
     const active = await this.start();
-    if (!active || !this.proc) {
-      throw new Error('Python worker not active');
-    }
-    
+    if (!active || !this.proc) throw new Error('Python worker not active');
+    const proc = this.proc;
+    const id = this.nextId++;
     return new Promise((resolve, reject) => {
-      this.queue.push({ resolve, reject });
-      this.proc!.stdin!.write(JSON.stringify({ content }) + '\n');
+      const timer = setTimeout(() => {
+        if (!this.pending.delete(id)) return; // already answered
+        reject(new Error(`Python worker timed out after ${parseTimeoutMs}ms`));
+        // The worker is likely wedged. Tear it down SYNCHRONOUSLY — don't wait
+        // for the async 'exit' event, which can lag — so the very next parse()
+        // reliably spawns a fresh worker instead of reusing the dead one.
+        if (this.proc === proc) {
+          this.proc = null;
+          this.startPromise = null;
+        }
+        this.rejectAllPending(new Error('Python worker restarted after a timeout'));
+        proc.kill(); // onDead for this proc will no-op (this.proc is no longer it)
+      }, parseTimeoutMs);
+      this.pending.set(id, { resolve, reject, timer });
+      try {
+        proc.stdin!.write(JSON.stringify({ id, content }) + '\n');
+      } catch (err) {
+        clearTimeout(timer);
+        this.pending.delete(id);
+        reject(err instanceof Error ? err : new Error(String(err)));
+      }
     });
   }
 }
@@ -223,6 +270,17 @@ export async function parsePythonFile(filePath: string, content: string, repoRoo
       ? c.external.map((ext) => resolvePythonImport(filePath, ext, repoRoot))
       : undefined,
   }));
+
+  // Guarantee unique ids: Python too can bind the same name twice — typing
+  // `@overload` stubs, or a conditional redefinition. Keep the first
+  // occurrence bare (references resolve to it) and suffix the rest so none is
+  // silently dropped when the store keys chunks by id.
+  const nameCounts = new Map<string, number>();
+  for (const chunk of chunks) {
+    const n = (nameCounts.get(chunk.symbolName) ?? 0) + 1;
+    nameCounts.set(chunk.symbolName, n);
+    if (n > 1) chunk.id = `${filePath}::${chunk.symbolName}$${n}`;
+  }
 
   if (chunks.length === 0 && content.trim().length > 0) {
     chunks.push({

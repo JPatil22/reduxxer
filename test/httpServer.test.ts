@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import http from 'node:http';
 import { AddressInfo } from 'node:net';
 import { IndexStore } from '../src/store.js';
 import { startHttpMcpServer } from '../src/httpServer.js';
@@ -63,6 +64,44 @@ test('HTTP Server Auth and Route Boundaries', async () => {
     const bodyInit = JSON.parse(match[1]);
     assert.equal(bodyInit.id, 1);
     assert.ok(bodyInit.result);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test('a spoofed non-loopback Host header is rejected even with a valid token', async () => {
+  const store = new IndexStore();
+  const token = 'my-secret-token';
+  const server = await startHttpMcpServer(store, 0, token);
+  const address = server.address() as AddressInfo;
+  try {
+    // Valid bearer token, but a Host header a malicious web page would forge
+    // to reach this loopback port. DNS-rebinding protection must reject it.
+    const status = await new Promise<number>((resolve, reject) => {
+      const req = http.request(
+        {
+          host: '127.0.0.1',
+          port: address.port,
+          path: '/mcp',
+          method: 'POST',
+          headers: {
+            Host: 'evil.example.com',
+            Authorization: `Bearer ${token}`,
+            Accept: 'application/json, text/event-stream',
+            'Content-Type': 'application/json',
+          },
+        },
+        (res) => {
+          res.resume();
+          resolve(res.statusCode ?? 0);
+        }
+      );
+      req.on('error', reject);
+      req.end(
+        JSON.stringify({ jsonrpc: '2.0', method: 'initialize', params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'x', version: '1' } }, id: 1 })
+      );
+    });
+    assert.equal(status, 403, 'spoofed Host is rejected by DNS-rebinding protection');
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }

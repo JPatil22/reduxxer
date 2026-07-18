@@ -286,6 +286,26 @@ test('trackSearch computes naive vs targeted token counts and cumulative savings
   assert.equal(savings.totalSavedTokens, entry.savedTokens);
 });
 
+test('tokenSavings.calls counts ALL calls past the search-log cap, consistent with the totals', () => {
+  const store = new IndexStore();
+  store.upsertFile('a.ts', 'h', [chunk({ symbolName: 'alpha', code: 'short' })], 'a much longer full file body here');
+  const results = store.allChunks();
+
+  const N = 205; // exceeds SEARCH_LOG_LIMIT (200), where the old code capped `calls`
+  let perCallNaive = 0;
+  for (let i = 0; i < N; i++) {
+    const e = store.trackSearch(`q${i}`, results);
+    if (i === 0) perCallNaive = e.naiveTokens;
+  }
+
+  const savings = store.tokenSavings();
+  assert.equal(savings.calls, N, 'calls reflects the true lifetime count, not the capped log length');
+  assert.equal(savings.recent.length, 10, 'recent stays a small rolling window');
+  // The naive baseline accumulates once per call, so the total must equal
+  // per-call-naive × calls — i.e. `calls` and the token totals agree.
+  assert.equal(savings.totalNaiveTokens, perCallNaive * N, 'totals are consistent with the call count');
+});
+
 test('save/load round-trips the index to disk', async () => {
   const store = new IndexStore();
   store.upsertFile('a.ts', 'hash1', [chunk({})], 'function foo() {}');

@@ -18,6 +18,16 @@ import { createMcpServer } from './mcpServer.js';
  */
 export async function startHttpMcpServer(store: IndexStore, port: number, token: string, logPath?: string): Promise<http.Server> {
   const sessions = new Map<string, StreamableHTTPServerTransport>();
+  // The Host header carries the ACTUAL listening port; with port 0 (OS-assigned,
+  // used in tests) that isn't known until after listen(), so the allowed-hosts
+  // list is built from the bound port below, not the requested one.
+  let boundPort = port;
+  const allowedHosts = () => [
+    '127.0.0.1',
+    'localhost',
+    `127.0.0.1:${boundPort}`,
+    `localhost:${boundPort}`,
+  ];
 
   const httpServer = http.createServer(async (req, res) => {
     if (req.url !== '/mcp') {
@@ -44,6 +54,12 @@ export async function startHttpMcpServer(store: IndexStore, port: number, token:
         const mcpServer = createMcpServer(store, logPath);
         const transport: StreamableHTTPServerTransport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
+          // Defense in depth against DNS-rebinding: a malicious web page can't
+          // point a victim's browser at this loopback port and drive it, since
+          // requests must carry a loopback Host header (the bearer token
+          // already blocks the practical attack; this closes the origin gap).
+          enableDnsRebindingProtection: true,
+          allowedHosts: allowedHosts(),
           onsessioninitialized: (id: string) => {
             sessions.set(id, transport);
           },
@@ -74,9 +90,15 @@ export async function startHttpMcpServer(store: IndexStore, port: number, token:
 
   // Bind to loopback only — this is meant for local tools on this machine,
   // not to be reachable from the network.
-  await new Promise<void>((resolve) => httpServer.listen(port, '127.0.0.1', resolve));
+  await new Promise<void>((resolve) =>
+    httpServer.listen(port, '127.0.0.1', () => {
+      const addr = httpServer.address();
+      if (addr && typeof addr === 'object') boundPort = addr.port; // resolve port 0 -> actual
+      resolve();
+    })
+  );
   console.error(
-    `context-daemon MCP server listening on http://127.0.0.1:${port}/mcp\n` +
+    `context-daemon MCP server listening on http://127.0.0.1:${boundPort}/mcp\n` +
       `Point multiple MCP clients at this same URL (with header "Authorization: Bearer ${token}") to share one index.`
   );
   return httpServer;

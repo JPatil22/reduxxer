@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { parseFile } from '../src/indexer.js';
+import { IndexStore } from '../src/store.js';
 
 test('parseFile extracts a function declaration as a chunk', () => {
   const chunks = parseFile('a.ts', 'export function greet(name: string) {\n  return `hi ${name}`;\n}\n');
@@ -165,4 +166,147 @@ test('parseFile does not record a call to an unrelated/unknown function as a ref
 test('parseFile does not record recursive self-calls as a reference', () => {
   const chunks = parseFile('a.ts', 'function factorial(n) { return n <= 1 ? 1 : n * factorial(n - 1); }\n');
   assert.equal(chunks[0].references, undefined);
+});
+
+// --- Symbol-ID collisions (overloads, declaration merging, accessors) -------
+
+test('parseFile merges function overloads into one chunk (no id collision)', () => {
+  const src = [
+    'export function foo(a: number): void;', // 1
+    'export function foo(a: string, b: number): void;', // 2
+    'export function foo(a: any, b?: number): void {', // 3
+    '  console.log(a, b);', // 4
+    '}', // 5
+  ].join('\n');
+  const chunks = parseFile('a.ts', src);
+  const foos = chunks.filter((c) => c.symbolName === 'foo');
+  assert.equal(foos.length, 1, 'the three overload declarations collapse to one chunk');
+  const foo = foos[0];
+  assert.equal(foo.id, 'a.ts::foo');
+  // The merged chunk spans the signatures through the implementation body.
+  assert.equal(foo.startLine, 1);
+  assert.equal(foo.endLine, 5);
+  assert.match(foo.code, /foo\(a: number\): void;/, 'overload signature kept');
+  assert.match(foo.code, /console\.log\(a, b\)/, 'implementation body kept');
+  // No duplicate ids anywhere in the file.
+  const ids = chunks.map((c) => c.id);
+  assert.equal(new Set(ids).size, ids.length, 'all chunk ids unique');
+});
+
+test('parseFile keeps both halves of a merged interface+function (distinct ids)', () => {
+  const chunks = parseFile(
+    'a.ts',
+    'export interface Config { port: number }\nexport function Config() { return { port: 3000 }; }\n'
+  );
+  const iface = chunks.find((c) => c.kind === 'interface' && c.symbolName === 'Config');
+  const fn = chunks.find((c) => c.kind === 'function' && c.symbolName === 'Config');
+  assert.ok(iface, 'the interface half is indexed');
+  assert.ok(fn, 'the function half is indexed');
+  assert.notEqual(iface!.id, fn!.id, 'same name, but ids must differ so neither is dropped');
+  assert.equal(iface!.id, 'a.ts::Config', 'first occurrence keeps the bare id');
+  assert.equal(fn!.id, 'a.ts::Config$2', 'the collision is suffixed');
+  const ids = chunks.map((c) => c.id);
+  assert.equal(new Set(ids).size, ids.length, 'all chunk ids unique');
+});
+
+test('parseFile indexes a get/set accessor pair as two distinct chunks', () => {
+  const src = [
+    'export class Box {',
+    '  private _v = 0;',
+    '  get value() { return this._v; }',
+    '  set value(v: number) { this._v = v; }',
+    '}',
+  ].join('\n');
+  const chunks = parseFile('a.ts', src);
+  const getter = chunks.find((c) => c.kind === 'getter');
+  const setter = chunks.find((c) => c.kind === 'setter');
+  assert.ok(getter && getter.symbolName === 'Box.value', 'getter chunk present');
+  assert.ok(setter && setter.symbolName === 'Box.value', 'setter chunk present');
+  assert.notEqual(getter!.id, setter!.id, 'get/set share a name but need distinct ids');
+  const ids = chunks.map((c) => c.id);
+  assert.equal(new Set(ids).size, ids.length, 'all chunk ids unique');
+});
+
+test('store: a colliding-name file lists no duplicate chunkIds and renders each symbol once', () => {
+  const src = [
+    'export interface Config { port: number }',
+    'export function Config() { return { port: 3000 }; }',
+    'export function foo(a: number): void;',
+    'export function foo(a: string): void;',
+    'export function foo(a: any): void { return; }',
+  ].join('\n');
+  const store = new IndexStore();
+  const chunks = parseFile('a.ts', src);
+  store.upsertFile('a.ts', 'hash1', chunks, src);
+
+  // Render the ghost view with the function `foo` as the matched symbol.
+  const foo = chunks.find((c) => c.kind === 'function' && c.symbolName === 'foo')!;
+  const ghost = store.buildContext([foo]);
+  // The matched symbol is expanded exactly once (old bug rendered it N times
+  // because chunkIds held the same id N times).
+  const fooMarkers = ghost.match(/^\/\/ ▸ foo\b/gm) ?? [];
+  assert.equal(fooMarkers.length, 1, 'overloaded `foo` renders exactly once');
+});
+
+// --- Anonymous default exports ---------------------------------------------
+
+test('parseFile indexes an anonymous default-exported function (was invisible)', () => {
+  const chunks = parseFile('Button.tsx', 'import React from "react";\nexport default function() {\n  return null;\n}\n');
+  const def = chunks.find((c) => c.symbolName === 'default');
+  assert.ok(def, 'anonymous default export is indexed');
+  assert.equal(def!.kind, 'function');
+  assert.match(def!.code, /return null/, 'its body is captured');
+});
+
+test('parseFile indexes an anonymous default-exported arrow (export default () => ...)', () => {
+  const chunks = parseFile('a.tsx', 'export default () => {\n  return 42;\n};\n');
+  const def = chunks.find((c) => c.symbolName === 'default');
+  assert.ok(def, 'default arrow export is indexed');
+  assert.match(def!.code, /return 42/);
+});
+
+test('parseFile does not synthesize a default chunk for `export default <identifier>`', () => {
+  // The identifier is already an indexed symbol; re-exporting needs no new chunk.
+  const chunks = parseFile('a.ts', 'const Widget = () => null;\nexport default Widget;\n');
+  assert.ok(chunks.some((c) => c.symbolName === 'Widget'));
+  assert.ok(!chunks.some((c) => c.symbolName === 'default'), 'no redundant default chunk');
+});
+
+// --- Namespaces / modules ---------------------------------------------------
+
+test('parseFile indexes a namespace and qualifies its members', () => {
+  const src = [
+    'export namespace Geometry {',
+    '  export function area(r: number) { return r * r; }',
+    '  export class Point { constructor(public x: number) {} }',
+    '}',
+  ].join('\n');
+  const chunks = parseFile('a.ts', src);
+  const names = chunks.map((c) => c.symbolName);
+  assert.ok(names.includes('Geometry'), 'the namespace itself is findable');
+  assert.equal(chunks.find((c) => c.symbolName === 'Geometry')!.kind, 'namespace');
+  assert.ok(names.includes('Geometry.area'), 'members are qualified with the namespace');
+  assert.ok(names.includes('Geometry.Point'));
+  // No bare, unqualified member leaks (which would collide across namespaces).
+  assert.ok(!names.includes('area'), 'members are not flattened to bare names');
+});
+
+// --- Class decorators -------------------------------------------------------
+
+test('parseFile renders class decorators on their own line above the signature', () => {
+  const src = [
+    '@Component({',
+    '  selector: "app-root",',
+    '  template: "<div></div>",',
+    '})',
+    'export class AppComponent {',
+    '  count = 0;',
+    '}',
+  ].join('\n');
+  const chunks = parseFile('a.ts', src);
+  const header = chunks.find((c) => c.kind === 'class' && c.symbolName === 'AppComponent')!;
+  assert.match(header.code, /@Component\(\{/, 'decorator is present in the header');
+  // The decorator sits on its own line, not mashed onto the class signature.
+  const sigLine = header.code.split('\n').find((l) => l.includes('class AppComponent'))!;
+  assert.doesNotMatch(sigLine, /@Component/, 'signature line has no decorator mashed into it');
 });

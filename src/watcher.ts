@@ -186,6 +186,10 @@ export async function indexRepo(store: IndexStore, rootDir: string): Promise<voi
   async function walk(dir: string) {
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
       if (entry.name.startsWith('.') && entry.name !== '.') continue;
+      // Never follow symlinks — a link like `evil.ts -> /outside/secret` would
+      // otherwise be read via fs.readFileSync and pulled into the index,
+      // escaping the repo the daemon was scoped to.
+      if (entry.isSymbolicLink()) continue;
       const full = path.join(dir, entry.name);
       if (ig.isIgnored(full)) continue;
       if (entry.isDirectory()) {
@@ -228,6 +232,10 @@ export async function reconcile(
     }
     for (const entry of entries) {
       if (entry.name.startsWith('.') && entry.name !== '.') continue;
+      // Never follow symlinks — a link like `evil.ts -> /outside/secret` would
+      // otherwise be read via fs.readFileSync and pulled into the index,
+      // escaping the repo the daemon was scoped to.
+      if (entry.isSymbolicLink()) continue;
       const full = path.join(dir, entry.name);
       if (ig.isIgnored(full)) continue;
       if (entry.isDirectory()) {
@@ -295,6 +303,7 @@ export function watchRepo(
     ignored: (filePath: string) => ig.isIgnored(filePath),
     ignoreInitial: true,
     persistent: true,
+    followSymlinks: false, // consistent with the walk: don't index outside the repo
     // A `change` event can fire mid-write (an editor saving, `git pull`
     // rewriting a file), so reading immediately can grab a partial or empty
     // file and index garbage. Wait until the file has stopped growing.

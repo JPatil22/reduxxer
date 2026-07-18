@@ -1,7 +1,7 @@
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
-import { parsePythonFile, closePythonWorker } from '../src/pythonIndexer.js';
+import { parsePythonFile, closePythonWorker, setPythonParseTimeoutForTests } from '../src/pythonIndexer.js';
 
 after(() => {
   closePythonWorker();
@@ -72,6 +72,64 @@ test('parsePythonFile records same-file call references between chunks', async (
   assert.deepEqual(processPayment.references, ['a.py::validate_card']);
   const validateCard = chunks.find((c) => c.symbolName === 'validate_card')!;
   assert.equal(validateCard.references, undefined);
+});
+
+test('parsePythonFile gives same-named defs (typing.overload/redefinition) distinct ids', async () => {
+  const chunks = await parsePythonFile(
+    'a.py',
+    [
+      'from typing import overload',
+      '',
+      '@overload',
+      'def read(x: int) -> int: ...',
+      '@overload',
+      'def read(x: str) -> str: ...',
+      'def read(x):',
+      '    return x',
+    ].join('\n')
+  );
+  const reads = chunks.filter((c) => c.symbolName === 'read');
+  assert.ok(reads.length >= 2, 'each same-named def is preserved, not collapsed by id collision');
+  const ids = chunks.map((c) => c.id);
+  assert.equal(new Set(ids).size, ids.length, 'all chunk ids unique');
+  assert.ok(ids.includes('a.py::read'), 'first occurrence keeps the bare id');
+  assert.ok(
+    ids.some((id) => /^a\.py::read\$\d+$/.test(id)),
+    'later occurrences are suffixed'
+  );
+});
+
+test('parsePythonFile handles many concurrent parses without desyncing responses', async () => {
+  // Fire many distinct files at the single shared worker at once. Each result
+  // must come back matched to ITS OWN request — the guarantee id-based
+  // correlation provides and the old arrival-order queue did not.
+  const N = 30;
+  const inputs = Array.from({ length: N }, (_, i) => ({ file: `f${i}.py`, src: `def func_${i}():\n    return ${i}\n` }));
+  const results = await Promise.all(inputs.map((inp) => parsePythonFile(inp.file, inp.src)));
+  for (let i = 0; i < N; i++) {
+    assert.equal(results[i].length, 1, `file ${i} returns exactly one chunk`);
+    assert.equal(results[i][0].symbolName, `func_${i}`, `file ${i} got its OWN function back, not another's`);
+  }
+});
+
+test('parsePythonFile times out instead of hanging, then recovers', async () => {
+  setPythonParseTimeoutForTests(1); // 1ms — the real round-trip cannot beat it
+  try {
+    const timedOut = await parsePythonFile('slow.py', 'def slow():\n    return 1\n');
+    assert.deepEqual(timedOut, [], 'a timed-out parse fails soft (returns []) rather than hanging forever');
+  } finally {
+    setPythonParseTimeoutForTests(15000); // restore before other tests run
+  }
+  const recovered = await parsePythonFile('fine.py', 'def fine():\n    return 2\n');
+  assert.ok(recovered.some((c) => c.symbolName === 'fine'), 'the worker respawned and works again after a timeout');
+});
+
+test('parsePythonFile respawns the worker after it is closed mid-session', async () => {
+  const before = await parsePythonFile('a.py', 'def a():\n    return 1\n');
+  assert.ok(before.some((c) => c.symbolName === 'a'));
+  closePythonWorker(); // simulate a crash / explicit shutdown
+  const after = await parsePythonFile('b.py', 'def b():\n    return 2\n');
+  assert.ok(after.some((c) => c.symbolName === 'b'), 'worker respawned transparently after being closed');
 });
 
 test('parsePythonFile records absolute imports resolved relative to repo root', async () => {

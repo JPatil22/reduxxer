@@ -72,3 +72,36 @@ test('a tiny budget still returns the single best match (never empty on a hit)',
   assert.equal(results.length, 1, 'tiny budget yields exactly the top match');
   assert.equal(results[0].symbolName, 'deltaTop');
 });
+
+test('searchWithinBudget packs many candidates without exceeding the budget', async () => {
+  const store = new IndexStore();
+  // 30 separate files, each a function containing the query terms, so ranking
+  // yields many primaries and the greedy fill has real packing work to do.
+  const query = 'process request validate payload handler pipeline';
+  for (let i = 0; i < 30; i++) {
+    const file = `/repo/mod_${i}.js`;
+    const code =
+      `function handle_${i}(req) {\n` +
+      Array.from({ length: 15 }, () => `  processRequest(validatePayload(req)); // handler pipeline`).join('\n') +
+      `\n}`;
+    store.upsertFile(file, `h${i}`, [chunk(file, `handle_${i}`, code)], 'x'.repeat(10));
+  }
+
+  const budget = 4000;
+  const results = await store.searchWithinBudget(query, budget);
+  assert.ok(results.length > 1, 'many candidates are packed, not just the top one');
+  const tokens = estimateTokens(store.buildContext(results));
+  // Allow a little slack for the inter-file "\n\n" separators the per-file
+  // token sum doesn't include; the fill must not blow far past the budget.
+  assert.ok(tokens <= budget * 1.1, `rendered ${tokens} tokens should stay near budget ${budget}`);
+
+  const big = await store.searchWithinBudget(query, 40000);
+  assert.ok(big.length > results.length, 'a larger budget includes more candidates');
+
+  const again = await store.searchWithinBudget(query, budget);
+  assert.deepEqual(
+    results.map((r) => r.id),
+    again.map((r) => r.id),
+    'selection is deterministic'
+  );
+});

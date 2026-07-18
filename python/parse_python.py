@@ -171,15 +171,19 @@ def main() -> None:
             line = line.strip()
             if not line:
                 continue
+            req_id = None
             try:
                 data = json.loads(line)
-                source = data["content"]
-                result = parse_source(source)
-                print(json.dumps(result))
-                sys.stdout.flush()
+                req_id = data.get("id")
+                result = parse_source(data["content"])
             except Exception as e:
-                print(json.dumps({"error": str(e)}))
-                sys.stdout.flush()
+                result = {"error": str(e)}
+            # Echo the request id so the Node side matches this response to its
+            # request BY ID, not by arrival order (order-based correlation
+            # desyncs permanently if a single line is malformed or dropped).
+            result["id"] = req_id
+            print(json.dumps(result))
+            sys.stdout.flush()
     else:
         source = sys.stdin.read()
         result = parse_source(source)

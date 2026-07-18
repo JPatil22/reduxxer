@@ -21,6 +21,7 @@
     "watch": "node dist/src/cli.js watch",
     "mcp": "node dist/src/cli.js mcp",
     "benchmark": "node dist/demo/benchmark.js",
+    "scale-bench": "node demo/scale-bench.mjs",
     "test": "node --test dist/test/*.test.js"
   },
   "repository": {

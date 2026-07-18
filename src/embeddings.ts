@@ -39,13 +39,40 @@ function getEmbedder(): Promise<FeatureExtractionPipeline> {
   return embedderPromise;
 }
 
+// Serialize inference. There is ONE shared ONNX pipeline, and its session is
+// not safe to call concurrently — yet concurrent searches (especially via the
+// HTTP multi-client transport) plus background indexing would otherwise invoke
+// it at the same time. A promise chain runs each inference only after the
+// previous one settles. Serializing costs nothing real here: this model's ONNX
+// runtime is single-threaded CPU, so concurrent calls would contend anyway.
+let inferenceLock: Promise<unknown> = Promise.resolve();
+
+function withInferenceLock<T>(task: () => Promise<T>): Promise<T> {
+  const run = inferenceLock.then(task, task);
+  // Keep the chain alive after this task settles, swallowing its result/error
+  // so one failed inference can't wedge every subsequent call.
+  inferenceLock = run.then(
+    () => undefined,
+    () => undefined
+  );
+  return run;
+}
+
+/** Test-only: exercise the inference serialization primitive directly, so a
+ *  test can prove calls don't overlap without loading the real model. */
+export function withInferenceLockForTests<T>(task: () => Promise<T>): Promise<T> {
+  return withInferenceLock(task);
+}
+
 /** Embeds text into a normalized vector. Truncate long inputs by the caller
  *  to keep inference fast — this model has a 256-token context window anyway. */
 export async function embedText(text: string): Promise<number[]> {
   if (!embeddingsEnabled) return [];
   const embedder = await getEmbedder();
-  const output = await embedder(text, { pooling: 'mean', normalize: true });
-  return Array.from(output.data as Float32Array);
+  return withInferenceLock(async () => {
+    const output = await embedder(text, { pooling: 'mean', normalize: true });
+    return Array.from(output.data as Float32Array);
+  });
 }
 
 /**

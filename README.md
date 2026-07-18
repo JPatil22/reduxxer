@@ -92,6 +92,33 @@ an actual project:
 node dist/src/cli.js index /path/to/a/real/repo
 ```
 
+### How much does it actually save?
+
+Measured, reproducible, and honest about the baseline. The comparison is:
+
+- **Baseline (without the daemon):** the AI reads the **whole file(s)** that
+  contain the code it needs — the common fallback when hunting for or
+  understanding code.
+- **With the daemon:** exactly what `search_context` returns — the rendered
+  **ghost-file view** (`buildContext`: module header + the matched symbol
+  bodies + one-line collapsed signatures of every other symbol in the file).
+  This is what the model actually receives, and it's what the numbers below
+  measure — *not* the raw matched-chunk bodies, which are smaller and would
+  overstate the result.
+
+On the **code-retrieval portion of a request**, that lands around
+**~50–65% fewer tokens** on real repositories (measured: ~63% across a
+mixed session on this repo via `node demo/measure-savings.mjs .`, ~52–54%
+on a larger real repo from the `requests.log` audit trail; the 3-file
+fixture is smaller at ~46% because there's little to collapse). Per-query
+it ranges widely (roughly 20–90%) depending on how much of the touched
+files the query actually needed.
+
+This is the **code-context portion only.** A real AI session also spends
+tokens on the system prompt, conversation history, and the model's own
+reply — the daemon doesn't change those, so whole-session reduction is
+smaller than the retrieval-only figure.
+
 The first index of a repo writes a `.context-daemon/index.json` snapshot
 into it; re-running only re-parses files whose content hash changed. Add
 `.context-daemon/` to that repo's `.gitignore`.
@@ -229,6 +256,42 @@ helpers, including helpers in *other* files, gets you those too, not just
 the entry point. Expansion is one hop deep and capped so it can't dwarf the
 real matches. Cross-file resolution covers JS/TS relative imports and Python
 `from ... import` statements.
+
+## Scaling (measured, reproducible)
+
+Run it yourself: `npm run scale-bench` (generates synthetic repos and reports
+the numbers below; embeddings are off so it measures the index/search/snapshot
+machinery, not model inference — see the script header for why). Representative
+run, Intel i5-10300H, Node 22, lexical path:
+
+| files | chunks | cold index | search (selective) | search (broad) | incr. re-index | snapshot | load | RSS |
+|------:|-------:|-----------:|-------------------:|---------------:|---------------:|---------:|-----:|----:|
+| 1,000 | 9,000 | 2.6s | 2ms | 20ms | 5ms | 4MB | 59ms | 186MB |
+| 5,000 | 45,000 | 8.4s | 6ms | 45ms | 3ms | 22MB | 229ms | 318MB |
+| 20,000 | 180,000 | 72s | 24ms | 278ms | 7ms | 90MB | 975ms | 714MB |
+
+What this shows honestly:
+
+- **Incremental editing stays flat (~3–7ms) at every size** — the BM25 stats are
+  maintained incrementally, not rebuilt per keystroke, so a search right after
+  an edit costs the same as any other search. This is the property that matters
+  for a live daemon, and it holds.
+- **Realistic searches stay fast** (~24ms at 180k chunks). A keyword **inverted
+  index** means only the chunks that actually contain a query term get scored,
+  not the whole corpus. The `search (broad)` column is the worst case — a query
+  whose every word appears in nearly *every* file, so the candidate set is
+  everything and it scans proportionally (~280ms at 180k). Real natural-language
+  queries use rarer, more selective terms and land in the `selective` column.
+- **Cold first-index is the real cost** and the honest weak point — ~72s for a
+  20k-file repo even without embeddings (with embeddings on, first-index of a
+  repo that large is much slower, bounded by the ~tens-of-ms-per-chunk model
+  cost). Persistence means it's paid **once**; restarts load the snapshot
+  (~1s at 180k chunks) instead of re-indexing.
+
+Fast-search (ANN) vs brute-force cosine, synthetic 384-d vectors: at 25,000
+vectors the ANN index answers in ~0.5ms vs brute-force's ~39ms (~80× faster),
+against a one-time index build of ~39s — consistent with the threshold-based
+design (brute-force below 20k chunks, ANN above).
 
 ## Known limitations
 
