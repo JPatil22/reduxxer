@@ -100,6 +100,9 @@ export class IndexStore {
   static setAnnThresholdForTests(n: number): void {
     IndexStore.ANN_THRESHOLD = n;
   }
+  // Running count of chunks that currently have an embedding, so maybeInitAnn's
+  // per-upsert threshold check is O(1) instead of scanning every chunk.
+  private embeddedCount = 0;
   private annIndex: AnnIndex | null = null;
 
   getFileHash(filePath: string): string | undefined {
@@ -116,6 +119,7 @@ export class IndexStore {
     const old = this.files.get(filePath);
     if (old) {
       for (const id of old.chunkIds) {
+        if (this.chunks.get(id)?.embedding) this.embeddedCount--;
         this.chunks.delete(id);
         this.annIndex?.remove(id);
         if (!this.bm25Dirty) this.removeChunkFromBm25(id);
@@ -132,6 +136,7 @@ export class IndexStore {
       seenIds.add(chunk.id);
       this.chunks.set(chunk.id, chunk);
       chunkIds.push(chunk.id);
+      if (chunk.embedding) this.embeddedCount++;
       if (this.annIndex && chunk.embedding) this.annIndex.add(chunk.id, chunk.embedding);
       // Keep BM25 stats current for just this file's chunks. Skipped while a
       // full rebuild is pending (bm25Dirty) — that rebuild will include them.
@@ -146,6 +151,7 @@ export class IndexStore {
     const old = this.files.get(filePath);
     if (old) {
       for (const id of old.chunkIds) {
+        if (this.chunks.get(id)?.embedding) this.embeddedCount--;
         this.chunks.delete(id);
         this.annIndex?.remove(id);
         if (!this.bm25Dirty) this.removeChunkFromBm25(id);
@@ -166,8 +172,13 @@ export class IndexStore {
    */
   private maybeInitAnn(): void {
     if (!annEnabled || this.annIndex) return;
+    // O(1) threshold check via the running counter — this runs on EVERY
+    // upsertFile, so materializing/filtering all chunks here (the old code) was
+    // O(chunks) per call and turned a bulk cold-index into O(n^2). Only once
+    // the threshold is actually crossed do we materialize, and just once.
+    if (this.embeddedCount < IndexStore.ANN_THRESHOLD) return;
     const embedded = [...this.chunks.values()].filter((c) => c.embedding);
-    if (embedded.length < IndexStore.ANN_THRESHOLD) return;
+    if (embedded.length === 0) return;
     try {
       const dim = embedded[0].embedding!.length;
       const idx = new AnnIndex(dim);
@@ -280,6 +291,12 @@ export class IndexStore {
     this.ensureBm25Current();
   }
 
+  /** Test-only: the running embedded-chunk counter that drives the O(1) ANN
+   *  threshold check, so a test can assert it stays exact through re-upserts. */
+  embeddedChunkCountForTests(): number {
+    return this.embeddedCount;
+  }
+
   /** BM25 scores for a query, computed through the inverted index: walk only
    *  the posting lists of the query terms, so only chunks that actually contain
    *  a query term are ever touched — not the whole corpus. Returns a map of
@@ -359,7 +376,12 @@ export class IndexStore {
    * context locality. The top match is always included even if it alone
    * exceeds the budget (better to answer with the best chunk than nothing).
    */
-  async searchWithinBudget(query: string, tokenBudget: number, maxPrimary = 25): Promise<CodeChunk[]> {
+  async searchWithinBudget(
+    query: string,
+    tokenBudget: number,
+    maxPrimary = 25,
+    capToTopFile = false
+  ): Promise<CodeChunk[]> {
     // Same discipline as search(): the only await is the embedding; everything
     // after it (ranking + the greedy assembly below) is synchronous, so it reads
     // one consistent index state and nothing can mutate mid-fill.
@@ -367,6 +389,15 @@ export class IndexStore {
     this.ensureBm25Current();
     const ranked = this.rankChunks(query, queryEmbedding, maxPrimary);
     if (ranked.length === 0) return [];
+
+    // capToTopFile: never return more than reading the top-matched file itself —
+    // the invariant that keeps the default lookup from ever costing MORE tokens
+    // than the one file that holds the answer (e.g. a broad query against a small
+    // file used to drag in several other files via dependency expansion). The
+    // top match is still always included even if that file alone exceeds this.
+    const budget = capToTopFile
+      ? Math.min(tokenBudget, this.files.get(ranked[0].filePath)?.tokens ?? tokenBudget)
+      : tokenBudget;
 
     const selected: CodeChunk[] = [];
     const selectedIds = new Set<string>();
@@ -392,7 +423,7 @@ export class IndexStore {
       relevant.add(c.id);
       const newBlockTokens = estimateTokens(this.renderFileBlock(fp, relevant));
       const newTotal = totalTokens - prevBlockTokens + newBlockTokens;
-      if (newTotal > tokenBudget && selected.length >= 1) {
+      if (newTotal > budget && selected.length >= 1) {
         relevant.delete(c.id); // revert; a smaller later match may still fit
         return false;
       }
@@ -404,21 +435,26 @@ export class IndexStore {
       return true;
     };
 
-    // Walk matches in rank order; for each, add it and its dependency closure
-    // (nearest deps first). A chunk that doesn't fit is SKIPPED, not a stop
-    // sign — a lower-ranked but smaller match may still fit, so we keep packing
-    // the budget with the most relevant context that fits rather than bailing
-    // on the first oversized one.
-    for (const primary of ranked) {
-      const queue: CodeChunk[] = [primary];
-      while (queue.length > 0) {
-        const c = queue.shift()!;
-        if (tryAdd(c)) {
-          for (const dep of this.directDependencies(c)) {
-            if (!selectedIds.has(dep.id)) queue.push(dep);
-          }
+    // Two phases, so the actual matches always take priority over any single
+    // match's dependency closure:
+    //   1. Add the ranked primaries themselves, best-first. This is what keeps
+    //      the #2 match from being crowded out by the #1 match's helpers — the
+    //      answer to a query is usually a top-ranked match, not a dependency.
+    //   2. Only THEN spend the remaining budget expanding dependencies (nearest
+    //      first), so a match's helpers get pulled in after the matches.
+    // A chunk that doesn't fit is SKIPPED, not a stop sign — a lower-ranked but
+    // smaller match may still fit, so we keep packing the most relevant context.
+    for (const primary of ranked) tryAdd(primary);
+
+    let frontier = ranked.filter((c) => selectedIds.has(c.id));
+    while (frontier.length > 0) {
+      const next: CodeChunk[] = [];
+      for (const c of frontier) {
+        for (const dep of this.directDependencies(c)) {
+          if (!selectedIds.has(dep.id) && tryAdd(dep)) next.push(dep);
         }
       }
+      frontier = next;
     }
 
     return selected;
@@ -803,10 +839,12 @@ export class IndexStore {
       this.bm25Postings.clear();
       this.bm25TotalLen = 0;
       this.bm25Dirty = true;
+      this.embeddedCount = 0;
       for (const file of snapshot.files) this.files.set(file.filePath, file);
       for (const chunk of snapshot.chunks) {
         const c = deserializeChunk(chunk);
         this.chunks.set(c.id, c);
+        if (c.embedding) this.embeddedCount++;
       }
       if (snapshot.lastUpdatedAt) this.lastUpdatedAt = snapshot.lastUpdatedAt;
       // Restore cumulative token-savings tracking so the counter reflects

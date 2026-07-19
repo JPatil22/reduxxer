@@ -181,22 +181,44 @@ This won't *force* it (nothing can, with MCP), but it's the most reliable way
 to make the assistant reach for the daemon by default instead of reading
 files.
 
-### Advanced: share one daemon across multiple tools (HTTP)
+### Share one daemon across your tools (the actual differentiator)
 
-Only needed if you want, say, Claude Code *and* Cursor hitting **one** shared
-index at the same time. Here you start the daemon yourself and leave it
-running:
+This is the point, not an afterthought. Run **one** daemon and point **every**
+AI tool on the repo at it, so they share a single live index instead of each
+spawning its own and re-indexing the same code. Claude Code and Cursor working
+the same repo hit the same in-memory index, and a file indexed **once** is
+instantly visible to **both**. That's verified by an automated test
+(`test/multiclient.test.ts`): an edit made once is seen by every connected
+client, and concurrent searches from multiple clients stay correct.
+
+Start the shared daemon and leave it running:
 
 ```bash
-node dist/src/cli.js mcp /path/to/a/real/repo --http --port=7621
+node dist/src/cli.js mcp /path/to/your/repo --http --port=7621
 ```
 
-This binds to `127.0.0.1` only and prints a per-repo auth token (generated
-once and saved to `.context-daemon/http-token`, or set your own with
-`--token=secret`). Configure each client to connect to
-`http://127.0.0.1:7621/mcp` over Streamable HTTP with header
-`Authorization: Bearer <token>`. All clients read and write through the
-same live index.
+It binds to `127.0.0.1` only and prints a per-repo bearer token (generated once
+and saved to `.context-daemon/http-token`, or set your own with
+`--token=secret`). Point each tool at the same URL over Streamable HTTP — the
+invariants are the URL and the `Authorization: Bearer <token>` header; the exact
+config key names follow each tool's MCP docs:
+
+```json
+{
+  "mcpServers": {
+    "context-daemon": {
+      "type": "http",
+      "url": "http://127.0.0.1:7621/mcp",
+      "headers": { "Authorization": "Bearer <token>" }
+    }
+  }
+}
+```
+
+All clients read and write through the same live index, and every call is
+attributed to the tool that made it in `.context-daemon/requests.log` — so
+`tokenreduxxer stats <repo>` shows a combined dashboard with a **per-client
+breakdown** of how much each tool saved through the shared daemon.
 
 Once connected, a tool can call:
 
@@ -266,9 +288,9 @@ run, Intel i5-10300H, Node 22, lexical path:
 
 | files | chunks | cold index | search (selective) | search (broad) | incr. re-index | snapshot | load | RSS |
 |------:|-------:|-----------:|-------------------:|---------------:|---------------:|---------:|-----:|----:|
-| 1,000 | 9,000 | 2.6s | 2ms | 20ms | 5ms | 4MB | 59ms | 186MB |
-| 5,000 | 45,000 | 8.4s | 6ms | 45ms | 3ms | 22MB | 229ms | 318MB |
-| 20,000 | 180,000 | 72s | 24ms | 278ms | 7ms | 90MB | 975ms | 714MB |
+| 1,000 | 9,000 | 1.7s | 1ms | 13ms | 2ms | 4MB | 50ms | 185MB |
+| 5,000 | 45,000 | 6.4s | 8ms | 64ms | 2ms | 22MB | 500ms | 313MB |
+| 20,000 | 180,000 | 29s | 28ms | 325ms | 3ms | 90MB | 1.3s | 714MB |
 
 What this shows honestly:
 
@@ -282,11 +304,15 @@ What this shows honestly:
   whose every word appears in nearly *every* file, so the candidate set is
   everything and it scans proportionally (~280ms at 180k). Real natural-language
   queries use rarer, more selective terms and land in the `selective` column.
-- **Cold first-index is the real cost** and the honest weak point — ~72s for a
-  20k-file repo even without embeddings (with embeddings on, first-index of a
-  repo that large is much slower, bounded by the ~tens-of-ms-per-chunk model
-  cost). Persistence means it's paid **once**; restarts load the snapshot
-  (~1s at 180k chunks) instead of re-indexing.
+- **Cold first-index is the largest cost**, though much improved — ~29s for a
+  20k-file / 180k-chunk repo without embeddings (was ~72s before a quadratic in
+  the fast-search threshold check was removed; it's now linear in repo size).
+  With embeddings on, first-index of a repo that large is slower still, bounded
+  by the ~tens-of-ms-per-chunk model cost. Persistence means it's paid **once**;
+  restarts load the snapshot (~1.3s at 180k chunks) instead of re-indexing.
+  Remaining first-index time is split between file I/O and single-threaded
+  parsing — a worker-thread parse pool is the next lever if it ever needs to be
+  faster.
 
 Fast-search (ANN) vs brute-force cosine, synthetic 384-d vectors: at 25,000
 vectors the ANN index answers in ~0.5ms vs brute-force's ~39ms (~80× faster),

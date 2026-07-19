@@ -15,6 +15,7 @@ Invoked as a subprocess from src/pythonIndexer.ts — one call per file.
 import ast
 import json
 import sys
+import time
 
 
 def called_names(node: ast.AST) -> set:
@@ -175,7 +176,12 @@ def main() -> None:
             try:
                 data = json.loads(line)
                 req_id = data.get("id")
-                result = parse_source(data["content"])
+                content = data["content"]
+                # Test seam: a wedged parse the Node side must time out and
+                # recover from. No real file content equals this sentinel.
+                if content == "__CONTEXT_DAEMON_TEST_HANG__":
+                    time.sleep(30)
+                result = parse_source(content)
             except Exception as e:
                 result = {"error": str(e)}
             # Echo the request id so the Node side matches this response to its

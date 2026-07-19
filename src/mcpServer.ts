@@ -8,8 +8,15 @@ import { SearchLogEntry } from './types.js';
 // Input bounds for the search_context tool — a client (or a prompt-injected
 // one) must not be able to drive unbounded work through it.
 const MAX_QUERY_LEN = 2000; // chars; a real natural-language query is far shorter
-const MAX_LIMIT = 50; // chunks
+const MAX_LIMIT = 50; // max primary matches
 const MAX_TOKEN_BUDGET = 200_000; // feeds the greedy budget assembly
+// Default context size when the caller doesn't specify one. Deliberately lean:
+// enough for the matched symbol(s) that answer a focused question, but small
+// enough that the result never balloons past just reading the file. The old
+// default ("5 chunks + unlimited cross-file dependency expansion") could return
+// several files' worth of code — MORE tokens than the single file that held the
+// answer — which defeats the whole point. Raise token_budget to pull in more.
+const DEFAULT_TOKEN_BUDGET = 1500;
 
 /** Clamp to [lo, hi]; a non-finite input (NaN/Infinity from a hostile client)
  *  falls back to the low bound rather than passing through. Exported for tests. */
@@ -76,12 +83,15 @@ export function createMcpServer(store: IndexStore, logPath?: string) {
       query: z
         .string()
         .describe('Plain-language description of the code you need, e.g. "handle user login" or "where orders get cancelled"'),
-      limit: z.number().optional().describe('Max chunks to return, default 5. Ignored when token_budget is set.'),
+      limit: z
+        .number()
+        .optional()
+        .describe('Max number of distinct primary matches to include (within the token budget). Optional.'),
       token_budget: z
         .number()
         .optional()
         .describe(
-          'If set, return as much relevant context (top matches plus the functions they depend on) as fits in about this many tokens, instead of a fixed chunk count. Tune to how much of your context window you want to spend on this lookup, e.g. 3000.'
+          'Roughly how many tokens of context to return — the top match(es) plus dependencies that fit. Defaults to a focused ~1500 that stays smaller than reading the file. Raise it (e.g. 4000) to pull in more context before a big edit.'
         ),
     },
     async ({ query, limit, token_budget }: { query: string; limit?: number; token_budget?: number }) => {
@@ -89,9 +99,14 @@ export function createMcpServer(store: IndexStore, logPath?: string) {
       // to drive unbounded work via a giant query, a huge limit, or a
       // pathological token_budget (which feeds the greedy budget assembly).
       const q = (typeof query === 'string' ? query : '').slice(0, MAX_QUERY_LEN);
-      const results = token_budget
-        ? await store.searchWithinBudget(q, clamp(token_budget, 1, MAX_TOKEN_BUDGET))
-        : await store.search(q, clamp(Math.floor(limit ?? 5), 1, MAX_LIMIT));
+      // Always budget-capped so the context can never balloon past reading the
+      // file; `limit` (when given) caps the number of primary matches within it.
+      // On the DEFAULT path (no explicit token_budget) also cap to the top-match
+      // file's size, so a lookup never returns more tokens than reading that
+      // file; an explicit token_budget is honored as-is (the caller opted in).
+      const budget = clamp(token_budget ?? DEFAULT_TOKEN_BUDGET, 1, MAX_TOKEN_BUDGET);
+      const maxPrimary = clamp(Math.floor(limit ?? 25), 1, MAX_LIMIT);
+      const results = await store.searchWithinBudget(q, budget, maxPrimary, token_budget == null);
       if (results.length === 0) {
         return {
           content: [

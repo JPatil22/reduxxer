@@ -112,11 +112,14 @@ test('parsePythonFile handles many concurrent parses without desyncing responses
   }
 });
 
-test('parsePythonFile times out instead of hanging, then recovers', async () => {
-  setPythonParseTimeoutForTests(1); // 1ms — the real round-trip cannot beat it
+test('parsePythonFile times out on a wedged parse, then recovers', async () => {
+  // The sentinel makes the worker sleep 30s (a genuinely wedged parse), so a
+  // generous 300ms timeout fires DETERMINISTICALLY — no racing a tiny timeout
+  // against the IPC round-trip.
+  setPythonParseTimeoutForTests(300);
   try {
-    const timedOut = await parsePythonFile('slow.py', 'def slow():\n    return 1\n');
-    assert.deepEqual(timedOut, [], 'a timed-out parse fails soft (returns []) rather than hanging forever');
+    const timedOut = await parsePythonFile('hang.py', '__CONTEXT_DAEMON_TEST_HANG__');
+    assert.deepEqual(timedOut, [], 'a wedged parse times out (returns []) rather than hanging forever');
   } finally {
     setPythonParseTimeoutForTests(15000); // restore before other tests run
   }

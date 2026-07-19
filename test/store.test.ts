@@ -444,6 +444,40 @@ function clusterEmbedding(cluster: number, variant: number): number[] {
   return v.map((x) => x / norm);
 }
 
+test('embedded-chunk counter stays exact through re-upserts and removes (drives the O(1) ANN check)', () => {
+  const store = new IndexStore();
+  const emb = [1, 0, 0];
+  // File A: two embedded chunks.
+  store.upsertFile(
+    'a.ts',
+    'h1',
+    [
+      chunk({ id: 'a.ts::x', filePath: 'a.ts', symbolName: 'x', embedding: emb }),
+      chunk({ id: 'a.ts::y', filePath: 'a.ts', symbolName: 'y', embedding: emb }),
+    ],
+    'x'
+  );
+  assert.equal(store.embeddedChunkCountForTests(), 2, 'both embedded chunks counted');
+
+  // Re-index A: one embedded + one WITHOUT an embedding. The old two must be
+  // decremented and the new one counted -> 1 (this is the tricky path where a
+  // stale counter would drift and trip the ANN threshold early).
+  store.upsertFile(
+    'a.ts',
+    'h2',
+    [
+      chunk({ id: 'a.ts::x', filePath: 'a.ts', symbolName: 'x', embedding: emb }),
+      chunk({ id: 'a.ts::z', filePath: 'a.ts', symbolName: 'z' }),
+    ],
+    'x'
+  );
+  assert.equal(store.embeddedChunkCountForTests(), 1, 'old embedded chunks decremented, new one counted');
+
+  // Removing the file drops the count to zero.
+  store.removeFile('a.ts');
+  assert.equal(store.embeddedChunkCountForTests(), 0, 'removal decrements the counter to zero');
+});
+
 test('ANN mode activates once the embedded-chunk count crosses the threshold, and search stays correct', async () => {
   const originalThreshold = 20000;
   IndexStore.setAnnThresholdForTests(12);
