@@ -104,6 +104,11 @@ export class IndexStore {
   // per-upsert threshold check is O(1) instead of scanning every chunk.
   private embeddedCount = 0;
   private annIndex: AnnIndex | null = null;
+  // Set if building the ANN index threw. Without this, a failed build would be
+  // retried on EVERY subsequent upsertFile — each retry materializing every
+  // chunk — silently reintroducing the O(n^2) bulk-index cost (and repeating
+  // the error) instead of quietly staying on the brute-force path.
+  private annBuildFailed = false;
 
   getFileHash(filePath: string): string | undefined {
     return this.files.get(filePath)?.hash;
@@ -171,7 +176,7 @@ export class IndexStore {
    * back to brute-force (annIndex stays null) rather than crash the daemon.
    */
   private maybeInitAnn(): void {
-    if (!annEnabled || this.annIndex) return;
+    if (!annEnabled || this.annIndex || this.annBuildFailed) return;
     // O(1) threshold check via the running counter — this runs on EVERY
     // upsertFile, so materializing/filtering all chunks here (the old code) was
     // O(chunks) per call and turned a bulk cold-index into O(n^2). Only once
@@ -192,6 +197,7 @@ export class IndexStore {
     } catch (err) {
       console.error('context-daemon: failed to build fast search index, falling back to standard search:', err);
       this.annIndex = null;
+      this.annBuildFailed = true; // stay on brute-force; don't retry every upsert
     }
   }
 
@@ -390,13 +396,20 @@ export class IndexStore {
     const ranked = this.rankChunks(query, queryEmbedding, maxPrimary);
     if (ranked.length === 0) return [];
 
-    // capToTopFile: never return more than reading the top-matched file itself —
-    // the invariant that keeps the default lookup from ever costing MORE tokens
-    // than the one file that holds the answer (e.g. a broad query against a small
-    // file used to drag in several other files via dependency expansion). The
-    // top match is still always included even if that file alone exceeds this.
+    // capToTopFile: don't return much more than reading the top-matched file —
+    // the invariant that stops a lookup from costing MORE tokens than the one
+    // file holding the answer (a broad query against a small file used to drag
+    // in several other files via dependency expansion).
+    //
+    // The MIN_CAP floor matters: the top match's file is not necessarily THE
+    // file. When the best match happens to sit in a tiny file, capping to that
+    // file's size starved the whole result to one or two chunks and the real
+    // answer (often in a larger file) never fit — measured as a 94% -> 75%
+    // recall drop. The floor keeps the anti-bloat property for real files while
+    // leaving room for a genuine multi-file answer.
+    const MIN_CAP = 1200;
     const budget = capToTopFile
-      ? Math.min(tokenBudget, this.files.get(ranked[0].filePath)?.tokens ?? tokenBudget)
+      ? Math.max(Math.min(tokenBudget, this.files.get(ranked[0].filePath)?.tokens ?? tokenBudget), MIN_CAP)
       : tokenBudget;
 
     const selected: CodeChunk[] = [];
@@ -833,6 +846,7 @@ export class IndexStore {
       this.files.clear();
       this.chunks.clear();
       this.annIndex = null;
+      this.annBuildFailed = false; // fresh corpus, fresh chance to build
       // Reset BM25 stats and flag a rebuild — they're recomputed lazily from
       // the loaded chunks on the first search (not maintained during load).
       this.bm25Docs.clear();

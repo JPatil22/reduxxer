@@ -68,7 +68,10 @@ let negDenom = 0;
 const misses = [];
 
 for (const { q, gold } of QUESTIONS) {
-  const results = await store.search(q, 5);
+  // Must mirror EXACTLY what the MCP search_context tool does, or this eval
+  // measures a code path users never hit (it previously called search(q,5),
+  // which the product stopped using when the default became budget-based).
+  const results = await store.searchWithinBudget(q, 1500, 25, true);
   const names = results.map((r) => r.symbolName);
   if (gold.length === 0) {
     negDenom++;

@@ -5,6 +5,13 @@ import { pipeline, type FeatureExtractionPipeline } from '@xenova/transformers';
  *  never silently mixed with fresh vectors from this one. */
 export const EMBEDDING_MODEL = 'Xenova/all-MiniLM-L6-v2';
 
+// Retrieval prefix seam (kept for a future model swap). MiniLM is symmetric —
+// no prefix either side. BGE-style models would set a query-side instruction
+// here; note that swapping models also requires recalibrating SEMANTIC_FLOOR in
+// store.ts (bge's similarity distribution broke the negative-control gate).
+const QUERY_PREFIX = '';
+const DOC_PREFIX = '';
+
 let embedderPromise: Promise<FeatureExtractionPipeline> | null = null;
 let embeddingsEnabled = true;
 
@@ -64,13 +71,16 @@ export function withInferenceLockForTests<T>(task: () => Promise<T>): Promise<T>
   return withInferenceLock(task);
 }
 
-/** Embeds text into a normalized vector. Truncate long inputs by the caller
- *  to keep inference fast — this model has a 256-token context window anyway. */
-export async function embedText(text: string): Promise<number[]> {
+/** Embeds text into a normalized vector. `kind` selects the retrieval prefix:
+ *  'query' for a search query, 'document' for an indexed code chunk — they must
+ *  match so the query and the chunks land in the same space. Callers truncate
+ *  long inputs to keep inference fast. */
+export async function embedText(text: string, kind: 'query' | 'document' = 'query'): Promise<number[]> {
   if (!embeddingsEnabled) return [];
   const embedder = await getEmbedder();
+  const input = (kind === 'query' ? QUERY_PREFIX : DOC_PREFIX) + text;
   return withInferenceLock(async () => {
-    const output = await embedder(text, { pooling: 'mean', normalize: true });
+    const output = await embedder(input, { pooling: 'mean', normalize: true });
     return Array.from(output.data as Float32Array);
   });
 }
@@ -86,11 +96,11 @@ export async function embedText(text: string): Promise<number[]> {
  * sequential; kept as its own function so call sites don't need to know
  * that, and so a future GPU/native runtime swap has one place to change.
  */
-export async function embedTexts(texts: string[]): Promise<number[][]> {
+export async function embedTexts(texts: string[], kind: 'query' | 'document' = 'document'): Promise<number[][]> {
   if (!embeddingsEnabled) return [];
   const vectors: number[][] = [];
   for (const text of texts) {
-    vectors.push(await embedText(text));
+    vectors.push(await embedText(text, kind));
   }
   return vectors;
 }
