@@ -96,3 +96,19 @@ if (misses.length) {
   for (const m of misses) console.log('  ' + m);
 }
 closePythonWorker();
+
+// Regression gate (used by CI). Retrieval quality is the whole point of this
+// tool, so a drop should fail the build rather than be noticed months later —
+// exactly how the "94%" figure silently became 75% when the default search path
+// changed. Tune the floor with EVAL_MIN_RECALL as quality improves.
+const MIN_RECALL = Number(process.env.EVAL_MIN_RECALL) || 0.7;
+const recall = recallDenom > 0 ? hits / recallDenom : 0;
+if (recall < MIN_RECALL) {
+  console.error(`\nFAIL: recall ${(recall * 100).toFixed(0)}% is below the ${(MIN_RECALL * 100).toFixed(0)}% floor.`);
+  process.exit(1);
+}
+if (negPass < negDenom) {
+  console.error(`\nFAIL: ${negDenom - negPass} negative control(s) returned results — the relevance gate regressed.`);
+  process.exit(1);
+}
+console.log('\nRegression gate: PASS');
